@@ -111,6 +111,19 @@ PHOTO_GUIDE_SVG = """
 def main():
     st.set_page_config(page_title="Train Collection", page_icon="\U0001f682", layout="wide")
 
+    # Family login
+    if "user_name" not in st.session_state:
+        st.session_state.user_name = ""
+    if not st.session_state.user_name:
+        st.markdown("## Welcome to the Train Collection")
+        st.markdown("**Sign in so AX knows who you are:**")
+        name = st.text_input("Your name", placeholder="e.g. Dad, Phil, Colin")
+        if name and st.button("Sign In", type="primary"):
+            st.session_state.user_name = name
+            st.rerun()
+        st.stop()
+    user_name = st.session_state.user_name
+
     if "app_title" not in st.session_state:
         st.session_state.app_title = "Dad's Train Collection"
     st.title(st.session_state.app_title)
@@ -126,6 +139,11 @@ def main():
     conn.close()
 
     with st.sidebar:
+        st.markdown(f"**Signed in as:** {user_name}")
+        if st.button("Sign Out", key="signout"):
+            st.session_state.user_name = ""
+            st.rerun()
+        st.markdown("---")
         new_title = st.text_input("Collection Title", st.session_state.app_title)
         if new_title != st.session_state.app_title:
             st.session_state.app_title = new_title; st.rerun()
@@ -307,7 +325,7 @@ def main():
             with st.chat_message("user", avatar="\U0001f9d1"): st.markdown(prompt)
             with st.chat_message("assistant", avatar="\U0001f916"):
                 with st.spinner("AX is thinking..."):
-                    ctx = f"Collection has {total} items. Brands: {', '.join(brands[:5])}." if brands else ""
+                    ctx = f"You're talking to {user_name}. Collection has {total} items. Brands: {', '.join(brands[:5])}." if brands else f"You're talking to {user_name}."
                     resp = chat_with_ax(prompt, ctx, st.session_state.train_chat)
                     st.markdown(resp)
                     st.session_state.train_chat.append({"role":"assistant","content":resp})
