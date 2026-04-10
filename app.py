@@ -356,6 +356,18 @@ def main():
             else:
                 st.info("Fill in details and click Generate Listing.")
 
+        # Auction house contacts
+        st.markdown("---")
+        st.markdown("### Auction House Contacts")
+        st.markdown("""
+        | House | Specialty | Contact |
+        |-------|-----------|---------|
+        | **Stout Auctions** | Premier train auctioneer | stoutauctions.com / (765) 764-6901 |
+        | **Trainz** | Ship collection, they sell it (15% commission) | sellmytrains.com |
+        | **Heritage Auctions** | High-value individual pieces | ha.com |
+        | **LiveAuctioneers** | Find specialist auctioneers | liveauctioneers.com |
+        """)
+
     # ── Stats ──
     with tab5:
         st.subheader("Collection Statistics")
@@ -417,6 +429,72 @@ def main():
                 st.download_button("Download CSV", csv_buf.getvalue(), "train_collection.csv", "text/csv")
                 json_str = all_df.to_json(orient="records", indent=2)
                 st.download_button("Download JSON", json_str, "train_collection.json", "application/json")
+
+                # Insurance/Estate report
+                st.markdown("---")
+                st.markdown("### Insurance / Estate Report")
+                st.caption("Generate a report for insurance or family estate planning.")
+                if st.button("Generate Report"):
+                    report = f"# Train Collection Inventory Report\n"
+                    report += f"**Generated:** {datetime.now().strftime('%B %d, %Y')}\n\n"
+                    report += f"**Total Items:** {total}\n"
+                    report += f"**Total Pieces:** {total_qty}\n"
+                    report += f"**Items with Values:** {with_values}\n"
+                    report += f"**Brands:** {', '.join(brands)}\n\n"
+                    report += "---\n\n"
+
+                    # Notable items first
+                    conn = get_db()
+                    notable_df = pd.read_sql_query("SELECT * FROM trains WHERE is_notable=1 ORDER BY brand", conn)
+                    common_df = pd.read_sql_query("SELECT * FROM trains WHERE is_notable=0 ORDER BY brand", conn)
+                    conn.close()
+
+                    if not notable_df.empty:
+                        report += "## High-Value Items\n\n"
+                        report += "| Item | Brand | Scale | Condition | Box | Est. Value |\n"
+                        report += "|------|-------|-------|-----------|-----|------------|\n"
+                        for _, r in notable_df.iterrows():
+                            report += f"| {r.get('item_name','')} | {r.get('brand','')} | {r.get('scale','')} | {r.get('condition','')} | {'Yes' if r.get('has_box') else 'No'} | {r.get('estimated_value','')} |\n"
+                        report += "\n"
+
+                    if not common_df.empty:
+                        report += "## All Other Items\n\n"
+                        report += "| Item | Brand | Scale | Qty | Condition | Value |\n"
+                        report += "|------|-------|-------|-----|-----------|-------|\n"
+                        for _, r in common_df.iterrows():
+                            report += f"| {r.get('item_name','')} | {r.get('brand','')} | {r.get('scale','')} | {r.get('quantity',1)} | {r.get('condition','')} | {r.get('estimated_value','')} |\n"
+
+                    report += "\n---\n"
+                    report += "\n## Selling Resources\n"
+                    report += "- **Stout Auctions** (stoutauctions.com) — Premier train auction house\n"
+                    report += "- **Trainz** (sellmytrains.com) — Ship collection, 15% commission\n"
+                    report += "- **Heritage Auctions** (ha.com) — For high-value individual pieces\n"
+                    report += "- **Greenberg's Price Guide** — Standard reference book\n"
+
+                    st.download_button("Download Report", report, "train_collection_report.md", "text/markdown")
+                    st.markdown(report)
+
+                # Auction house packet
+                st.markdown("---")
+                st.markdown("### Auction House Packet")
+                if st.button("Generate Auction Submission"):
+                    conn = get_db()
+                    items_df = pd.read_sql_query("SELECT item_name,brand,scale,era,catalog_number,condition,has_box,estimated_value FROM trains WHERE is_notable=1 ORDER BY brand", conn)
+                    conn.close()
+                    packet = f"Dear Auction Team,\n\n"
+                    packet += f"I would like to consign my model train collection for auction.\n\n"
+                    packet += f"Collection Overview:\n"
+                    packet += f"- Total items: {total}\n"
+                    packet += f"- Brands: {', '.join(brands[:10])}\n"
+                    packet += f"- Scales: {', '.join(scales)}\n\n"
+                    if not items_df.empty:
+                        packet += f"Notable Items ({len(items_df)}):\n\n"
+                        for _, r in items_df.iterrows():
+                            packet += f"  - {r.get('brand','')} {r.get('item_name','')} (#{r.get('catalog_number','')}) - {r.get('condition','')} - Box: {'Yes' if r.get('has_box') else 'No'}\n"
+                    packet += f"\nPlease advise on consignment terms, pickup/shipping options, and estimated timeline.\n"
+                    packet += f"\nThank you."
+                    st.download_button("Download Packet", packet, "auction_submission.txt", "text/plain")
+                    st.text_area("Preview", packet, height=300)
 
             st.markdown("---")
             if total > 0 and st.button("Clear All"):
