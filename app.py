@@ -196,52 +196,101 @@ def main():
             5. **Include the box** if you have it - boxes add significant value
             """)
 
-        scan_type = st.radio("Scan mode", ["Single Item ID", "Room/Shelf Scan (multiple items)"], horizontal=True)
-        photos = st.file_uploader("Upload photo(s)", type=["jpg","jpeg","png","webp"], accept_multiple_files=True)
+        scan_type = st.radio("Scan mode", [
+            "Single Item (1 photo, 1 item)",
+            "Shelf/Table Scan (1 photo, finds ALL items)",
+            "Batch Scan (multiple photos, 1 item each)"
+        ], horizontal=False)
+        photos = st.file_uploader("Upload photo(s) - take as many as you want",
+            type=["jpg","jpeg","png","webp"], accept_multiple_files=True)
 
-        if photos and st.button("Scan", type="primary"):
+        if photos:
+            st.caption(f"{len(photos)} photo(s) selected")
+
+        if photos and st.button("Scan All Photos", type="primary"):
             if not API_KEY:
                 st.error("No API key configured.")
             else:
-                with st.spinner("AX is identifying your trains..."):
-                    try:
-                        from engine import VisionEngine
-                        from train_prompts import TRAIN_IDENTIFIER, TRAIN_ROOM_SCAN
-                        engine = VisionEngine(provider="haiku")
-                        img_bytes = photos[0].read()
-                        prompt = TRAIN_IDENTIFIER if scan_type.startswith("Single") else TRAIN_ROOM_SCAN
-                        results = engine.analyze(img_bytes, prompt)
-                        if results:
-                            st.success(f"Found {len(results)} item(s)!")
-                            col1, col2 = st.columns([1, 2])
-                            with col1: st.image(img_bytes, width=300)
-                            with col2:
-                                for r in results:
-                                    d = r.raw
-                                    st.markdown(f"### {d.get('item_name','Unknown')}")
-                                    st.markdown(f"**Brand:** {d.get('brand','')} | **Scale:** {d.get('scale','')} | **Era:** {d.get('era','')}")
-                                    st.markdown(f"**Condition:** {d.get('condition','')} | **Box:** {'Yes' if d.get('has_original_box') else 'No'}")
-                                    if d.get('estimated_value'):
-                                        st.markdown(f"**Est. Value:** ${d['estimated_value']}")
-                                    st.markdown(f"*{d.get('value_notes','')}*")
-                                    if st.button(f"Add to Collection", key=f"add_{d.get('item_name','')}"):
-                                        conn = get_db()
-                                        conn.execute("""INSERT INTO trains (item_name,brand,scale,era,item_type,
-                                            catalog_number,condition,has_box,estimated_value,value_notes,
-                                            is_notable,last_updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                            (d.get("item_name",""),d.get("brand",""),d.get("scale",""),
-                                             d.get("era",""),d.get("type",""),d.get("catalog_number",""),
-                                             d.get("condition",""),1 if d.get("has_original_box") else 0,
-                                             str(d.get("estimated_value","")) if d.get("estimated_value") else "",
-                                             d.get("value_notes",""),
-                                             1 if is_notable(d.get("item_name",""),d.get("brand",""),d.get("era","")) else 0,
-                                             datetime.now().isoformat()))
-                                        conn.commit(); conn.close(); st.success("Added!")
-                                    st.markdown("---")
-                        else:
-                            st.warning("Could not identify items. Try a clearer photo.")
-                    except Exception as e:
-                        st.error(f"Error: {e}")
+                try:
+                    from engine import VisionEngine
+                    from train_prompts import TRAIN_IDENTIFIER, TRAIN_ROOM_SCAN
+                    engine = VisionEngine(provider="haiku")
+
+                    all_results = []
+                    all_images = []
+
+                    # Process each photo
+                    for i, photo in enumerate(photos):
+                        img_bytes = photo.read()
+                        all_images.append(img_bytes)
+                        prompt = TRAIN_ROOM_SCAN if scan_type.startswith("Shelf") else TRAIN_IDENTIFIER
+
+                        with st.spinner(f"Scanning photo {i+1} of {len(photos)}..."):
+                            results = engine.analyze(img_bytes, prompt)
+                            for r in results:
+                                r.raw["_photo_index"] = i
+                            all_results.extend(results)
+
+                    if all_results:
+                        st.success(f"Found **{len(all_results)} item(s)** across {len(photos)} photo(s)!")
+
+                        # Store for Add All button
+                        st.session_state["scan_results"] = [r.raw for r in all_results]
+
+                        # Add All button at top
+                        if st.button("Add ALL to Collection", type="primary", key="add_all_trains"):
+                            conn = get_db()
+                            added = 0
+                            for d in st.session_state["scan_results"]:
+                                conn.execute("""INSERT INTO trains (item_name,brand,scale,era,item_type,
+                                    catalog_number,condition,has_box,estimated_value,value_notes,
+                                    is_notable,last_updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                    (d.get("item_name",""),d.get("brand",""),d.get("scale",""),
+                                     d.get("era",""),d.get("type",""),d.get("catalog_number",""),
+                                     d.get("condition",""),1 if d.get("has_original_box") else 0,
+                                     str(d.get("estimated_value","")) if d.get("estimated_value") else "",
+                                     d.get("value_notes",""),
+                                     1 if is_notable(d.get("item_name",""),d.get("brand",""),d.get("era","")) else 0,
+                                     datetime.now().isoformat()))
+                                added += 1
+                            conn.commit(); conn.close()
+                            st.success(f"Added {added} items to collection!")
+                            st.session_state.pop("scan_results", None)
+                            st.rerun()
+
+                        # Display results grouped by photo
+                        for i, img_bytes in enumerate(all_images):
+                            photo_results = [r for r in all_results if r.raw.get("_photo_index") == i]
+                            if photo_results:
+                                st.markdown(f"### Photo {i+1} - {len(photo_results)} item(s)")
+                                col1, col2 = st.columns([1, 2])
+                                with col1: st.image(img_bytes, width=280)
+                                with col2:
+                                    for r in photo_results:
+                                        d = r.raw
+                                        st.markdown(f"**{d.get('item_name','Unknown')}**")
+                                        st.markdown(f"Brand: {d.get('brand','')} | Scale: {d.get('scale','')} | Era: {d.get('era','')}")
+                                        st.markdown(f"Condition: {d.get('condition','')} | Box: {'Yes' if d.get('has_original_box') else 'No'}")
+                                        val = d.get('estimated_value')
+                                        if val: st.markdown(f"**Est. Value: ${val}**")
+                                        if d.get('value_notes'): st.caption(d['value_notes'])
+                                        if st.button(f"Add This One", key=f"add_{i}_{d.get('item_name','')[:20]}"):
+                                            conn = get_db()
+                                            conn.execute("""INSERT INTO trains (item_name,brand,scale,era,item_type,
+                                                catalog_number,condition,has_box,estimated_value,value_notes,
+                                                is_notable,last_updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                                (d.get("item_name",""),d.get("brand",""),d.get("scale",""),
+                                                 d.get("era",""),d.get("type",""),d.get("catalog_number",""),
+                                                 d.get("condition",""),1 if d.get("has_original_box") else 0,
+                                                 str(val) if val else "",d.get("value_notes",""),
+                                                 1 if is_notable(d.get("item_name",""),d.get("brand",""),d.get("era","")) else 0,
+                                                 datetime.now().isoformat()))
+                                            conn.commit(); conn.close(); st.success("Added!")
+                                        st.markdown("---")
+                    else:
+                        st.warning("Could not identify items. Try clearer photos with good lighting.")
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
     # ── Ask AX ──
     with tab3:
