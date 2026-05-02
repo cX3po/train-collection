@@ -6,6 +6,7 @@ import os
 import io
 import shutil
 import subprocess
+import uuid
 import pandas as pd
 from datetime import datetime
 
@@ -13,6 +14,23 @@ from datetime import datetime
 MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB per uploaded photo
 MAX_PHOTOS_PER_SCAN = 10
 SQLITE_BUSY_TIMEOUT_MS = 5000
+
+
+def _claude_cli_supports(flag: str) -> bool:
+    """Verify the installed claude CLI accepts a given flag.
+
+    Without this check, a CLI version mismatch would silently fall through
+    to the API on every chat call — re-creating the per-token billing scar
+    the CLI swap was meant to close.
+    """
+    bin_path = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+    if not os.path.exists(bin_path):
+        return False
+    try:
+        r = subprocess.run([bin_path, "--help"], capture_output=True, text=True, timeout=5)
+        return flag in (r.stdout + r.stderr)
+    except Exception:
+        return False
 
 # Load API key (used for vision; chat uses CLI under Phil's Max subscription)
 def load_api_key():
@@ -43,6 +61,16 @@ def _md_cell(value):
     s = str(value)
     return s.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").replace("\r", " ")
 
+
+def _flat(value):
+    """Flatten value to single-line plain text. For non-table outputs (auction packet)."""
+    if value is None:
+        return ""
+    return str(value).replace("\n", " ").replace("\r", " ")
+
+
+_DB_INITIALIZED = False  # one-shot flag — WAL is a persistent file-level setting
+
 NOTABLE_BRANDS = {"lionel","american flyer","marx","ives","mth","williams","k-line",
     "weaver","atlas","bachmann","kato","athearn","walthers","brass","tenshodo",
     "overland","3rd rail","sunset","rivarossi","marklin","fleischmann","hornby"}
@@ -57,6 +85,9 @@ def is_notable(item_name, brand, era=""):
     return False
 
 def init_db():
+    global _DB_INITIALIZED
+    if _DB_INITIALIZED:
+        return
     conn = sqlite3.connect(DB_PATH, timeout=5.0)
     c = conn.cursor()
     c.execute("PRAGMA journal_mode=WAL")
@@ -71,6 +102,7 @@ def init_db():
         is_notable INTEGER DEFAULT 0, notes TEXT, last_updated TEXT
     )""")
     conn.commit(); conn.close()
+    _DB_INITIALIZED = True
 
 def get_db():
     init_db()
@@ -87,6 +119,11 @@ Be warm, practical, and honest about what you know. Never invent prices."""
 
 GENERIC_AX_FAILURE = "AX is unavailable right now. Try again in a moment."
 
+# Verify CLI flag support at module load — guards against silent fall-through to API.
+CLAUDE_CLI_USABLE = os.path.exists(CLAUDE_BIN) and _claude_cli_supports("--append-system-prompt")
+if os.path.exists(CLAUDE_BIN) and not CLAUDE_CLI_USABLE:
+    print(f"[trains] WARNING: claude CLI at {CLAUDE_BIN} missing --append-system-prompt; chat will use API (per-token billing).")
+
 
 def _chat_via_cli(message, system, history):
     """Run AX via local Claude CLI (Max subscription, $0 marginal cost).
@@ -95,7 +132,7 @@ def _chat_via_cli(message, system, history):
     key over the Max OAuth subscription when both are present, and inheriting
     the parent's key would silently bill per-token (COST.md scar 2026-04-22).
     """
-    if not os.path.exists(CLAUDE_BIN):
+    if not CLAUDE_CLI_USABLE:
         return None  # caller falls back
 
     transcript_parts = []
@@ -394,6 +431,10 @@ def main():
                                         st.markdown("---")
                     else:
                         st.warning("Could not identify items. Try clearer photos with good lighting.")
+                except ValueError as ve:
+                    # validate_image: too small, too large, unrecognized format
+                    print(f"[scan] validation error: {ve}")
+                    st.error(f"Image issue: {ve}")
                 except Exception as e:
                     print(f"[scan] error: {e}")
                     st.error("Photo scan failed. Try clearer photos or try again in a moment.")
@@ -596,9 +637,6 @@ def main():
                     if not items_df.empty:
                         packet += f"Notable Items ({len(items_df)}):\n\n"
                         for _, r in items_df.iterrows():
-                            # Plain-text packet — strip newlines but keep | (not a delimiter here)
-                            def _flat(v):
-                                return str(v or "").replace("\n", " ").replace("\r", " ")
                             packet += f"  - {_flat(r.get('brand'))} {_flat(r.get('item_name'))} (#{_flat(r.get('catalog_number'))}) - {_flat(r.get('condition'))} - Box: {'Yes' if r.get('has_box') else 'No'}\n"
                     packet += f"\nPlease advise on consignment terms, pickup/shipping options, and estimated timeline.\n"
                     packet += f"\nThank you."
@@ -615,13 +653,28 @@ def main():
                             try:
                                 conn = get_db()
                                 backup_df = pd.read_sql_query("SELECT * FROM trains", conn)
-                                ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-                                backup_path = os.path.join(os.path.dirname(DB_PATH), f"backup-{ts}.csv")
-                                backup_df.to_csv(backup_path, index=False)
+                                # If a concurrent clear already emptied the table, do not
+                                # write an empty backup that would overwrite the prior one.
+                                if backup_df.empty:
+                                    conn.close()
+                                    st.session_state.pop("confirm_clear_all", None)
+                                    st.info("Already empty — nothing to clear.")
+                                    st.rerun()
+                                # Microsecond timestamp + short uuid + exclusive create =
+                                # filename collision is astronomically improbable AND
+                                # refused at the OS layer if it ever occurs.
+                                ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                                backup_name = f"backup-{ts}-{uuid.uuid4().hex[:8]}.csv"
+                                backup_path = os.path.join(os.path.dirname(DB_PATH), backup_name)
+                                with open(backup_path, "x", newline="") as f:
+                                    backup_df.to_csv(f, index=False)
                                 conn.execute("DELETE FROM trains"); conn.commit(); conn.close()
                                 st.session_state.pop("confirm_clear_all", None)
-                                st.success(f"Cleared. Backup saved to db/{os.path.basename(backup_path)}")
+                                st.success(f"Cleared. Backup saved to db/{backup_name}")
                                 st.rerun()
+                            except FileExistsError as fee:
+                                print(f"[clear_all] backup filename collision (extremely rare): {fee}")
+                                st.error("Backup filename collision — please retry.")
                             except Exception as e:
                                 print(f"[clear_all] failed: {e}")
                                 st.error("Clear failed. The collection is unchanged.")
