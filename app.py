@@ -3,17 +3,24 @@
 import streamlit as st
 import sqlite3
 import os
-import re
 import io
+import shutil
+import subprocess
 import pandas as pd
 from datetime import datetime
 
-# Load API key
+# Family-deployment limits (this is a 5-user-max app on Phil's Nano)
+MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB per uploaded photo
+MAX_PHOTOS_PER_SCAN = 10
+SQLITE_BUSY_TIMEOUT_MS = 5000
+
+# Load API key (used for vision; chat uses CLI under Phil's Max subscription)
 def load_api_key():
     try:
         key = st.secrets.get("ANTHROPIC_API_KEY", "")
         if key: return key
-    except: pass
+    except (FileNotFoundError, KeyError, AttributeError):
+        pass
     env_path = os.path.expanduser("~/axiom/.env")
     if os.path.exists(env_path):
         with open(env_path) as f:
@@ -25,7 +32,16 @@ def load_api_key():
 API_KEY = load_api_key()
 if API_KEY: os.environ["ANTHROPIC_API_KEY"] = API_KEY
 
+CLAUDE_BIN = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db", "trains.db")
+
+
+def _md_cell(value):
+    """Escape characters that would break a markdown table cell."""
+    if value is None:
+        return ""
+    s = str(value)
+    return s.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").replace("\r", " ")
 
 NOTABLE_BRANDS = {"lionel","american flyer","marx","ives","mth","williams","k-line",
     "weaver","atlas","bachmann","kato","athearn","walthers","brass","tenshodo",
@@ -41,8 +57,10 @@ def is_notable(item_name, brand, era=""):
     return False
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5.0)
     c = conn.cursor()
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     c.execute("""CREATE TABLE IF NOT EXISTS trains (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         item_name TEXT, brand TEXT, scale TEXT, era TEXT,
@@ -56,17 +74,62 @@ def init_db():
 
 def get_db():
     init_db()
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=5.0)
+    conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    return conn
 
-def chat_with_ax(message, context="", history=None):
-    import requests
-    if not API_KEY: return "No API key. Add ANTHROPIC_API_KEY in settings."
-    system = """You are AX, a friendly and knowledgeable AI assistant for the family.
+# AX system prompt (shared by CLI + API fallback paths)
+AX_SYSTEM_PROMPT = """You are AX, a friendly and knowledgeable AI assistant for the family.
 You're an expert in model trains and railroadiana - Lionel, American Flyer, Marx, HO, N, O gauge, brass, vintage tinplate.
 You help identify trains, estimate values, advise on selling via auction houses or eBay.
 You know Heritage Auctions, Stout Auctions, and other train auction specialists.
 Be warm, practical, and honest about what you know. Never invent prices."""
-    if context: system += f"\n\nContext: {context}"
+
+GENERIC_AX_FAILURE = "AX is unavailable right now. Try again in a moment."
+
+
+def _chat_via_cli(message, system, history):
+    """Run AX via local Claude CLI (Max subscription, $0 marginal cost).
+
+    Scrubs ANTHROPIC_API_KEY from the child env — claude CLI prefers the API
+    key over the Max OAuth subscription when both are present, and inheriting
+    the parent's key would silently bill per-token (COST.md scar 2026-04-22).
+    """
+    if not os.path.exists(CLAUDE_BIN):
+        return None  # caller falls back
+
+    transcript_parts = []
+    if history:
+        for msg in history[-10:]:
+            role = msg.get("role", "user").upper()
+            transcript_parts.append(f"{role}: {msg['content']}")
+    transcript_parts.append(f"USER: {message}")
+    full_input = "\n\n".join(transcript_parts)
+
+    child_env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    cmd = [CLAUDE_BIN, "-p", "--model", "claude-haiku-4-5-20251001",
+           "--append-system-prompt", system]
+    try:
+        result = subprocess.run(cmd, input=full_input, capture_output=True,
+                                text=True, timeout=60, env=child_env)
+    except subprocess.TimeoutExpired:
+        print("[chat_with_ax] CLI timeout after 60s")
+        return None
+    except Exception as e:
+        print(f"[chat_with_ax] CLI subprocess error: {e}")
+        return None
+
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip()
+    print(f"[chat_with_ax] CLI rc={result.returncode} stderr={result.stderr[:300]}")
+    return None
+
+
+def _chat_via_api(message, system, history):
+    """Fallback: hit the Anthropic API directly."""
+    import requests
+    if not API_KEY:
+        return GENERIC_AX_FAILURE
     messages = []
     if history:
         for msg in history[-10:]:
@@ -77,9 +140,22 @@ Be warm, practical, and honest about what you know. Never invent prices."""
             headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
             json={"model": "claude-haiku-4-5-20251001", "max_tokens": 1024,
                   "system": system, "messages": messages}, timeout=30)
-        if resp.ok: return resp.json()["content"][0]["text"]
-        return f"API error: {resp.status_code}"
-    except Exception as e: return f"Error: {e}"
+        if resp.ok:
+            return resp.json()["content"][0]["text"]
+        print(f"[chat_with_ax] API HTTP {resp.status_code}: {resp.text[:300]}")
+        return GENERIC_AX_FAILURE
+    except Exception as e:
+        print(f"[chat_with_ax] API exception: {e}")
+        return GENERIC_AX_FAILURE
+
+
+def chat_with_ax(message, context="", history=None):
+    """AX chat. Tries local Claude CLI first (free under Max), falls back to API."""
+    system = AX_SYSTEM_PROMPT + (f"\n\nContext: {context}" if context else "")
+    cli_reply = _chat_via_cli(message, system, history)
+    if cli_reply is not None:
+        return cli_reply
+    return _chat_via_api(message, system, history)
 
 def generate_sell_listing(item_info, method="eBay"):
     if method == "eBay":
@@ -219,11 +295,22 @@ def main():
             "Shelf/Table Scan (1 photo, finds ALL items)",
             "Batch Scan (multiple photos, 1 item each)"
         ], horizontal=False)
-        photos = st.file_uploader("Upload photo(s) - take as many as you want",
+        photos = st.file_uploader(
+            f"Upload photo(s) - up to {MAX_PHOTOS_PER_SCAN}, max {MAX_FILE_BYTES // 1024 // 1024} MB each",
             type=["jpg","jpeg","png","webp"], accept_multiple_files=True)
 
         if photos:
-            st.caption(f"{len(photos)} photo(s) selected")
+            if len(photos) > MAX_PHOTOS_PER_SCAN:
+                st.error(f"Too many photos. Limit is {MAX_PHOTOS_PER_SCAN} per scan; you uploaded {len(photos)}. Take a smaller batch.")
+                photos = []
+            else:
+                oversized = [p.name for p in photos if p.size > MAX_FILE_BYTES]
+                if oversized:
+                    st.warning(f"Skipping over-{MAX_FILE_BYTES // 1024 // 1024}-MB photo(s): {', '.join(oversized)}")
+                    photos = [p for p in photos if p.size <= MAX_FILE_BYTES]
+                if photos:
+                    total_mb = sum(p.size for p in photos) / 1024 / 1024
+                    st.caption(f"{len(photos)} photo(s) selected · {total_mb:.1f} MB total")
 
         if photos and st.button("Scan All Photos", type="primary"):
             if not API_KEY:
@@ -308,7 +395,8 @@ def main():
                     else:
                         st.warning("Could not identify items. Try clearer photos with good lighting.")
                 except Exception as e:
-                    st.error(f"Error: {e}")
+                    print(f"[scan] error: {e}")
+                    st.error("Photo scan failed. Try clearer photos or try again in a moment.")
 
     # ── Ask AX ──
     with tab3:
@@ -472,7 +560,7 @@ def main():
                         report += "| Item | Brand | Scale | Condition | Box | Est. Value |\n"
                         report += "|------|-------|-------|-----------|-----|------------|\n"
                         for _, r in notable_df.iterrows():
-                            report += f"| {r.get('item_name','')} | {r.get('brand','')} | {r.get('scale','')} | {r.get('condition','')} | {'Yes' if r.get('has_box') else 'No'} | {r.get('estimated_value','')} |\n"
+                            report += f"| {_md_cell(r.get('item_name'))} | {_md_cell(r.get('brand'))} | {_md_cell(r.get('scale'))} | {_md_cell(r.get('condition'))} | {'Yes' if r.get('has_box') else 'No'} | {_md_cell(r.get('estimated_value'))} |\n"
                         report += "\n"
 
                     if not common_df.empty:
@@ -480,7 +568,7 @@ def main():
                         report += "| Item | Brand | Scale | Qty | Condition | Value |\n"
                         report += "|------|-------|-------|-----|-----------|-------|\n"
                         for _, r in common_df.iterrows():
-                            report += f"| {r.get('item_name','')} | {r.get('brand','')} | {r.get('scale','')} | {r.get('quantity',1)} | {r.get('condition','')} | {r.get('estimated_value','')} |\n"
+                            report += f"| {_md_cell(r.get('item_name'))} | {_md_cell(r.get('brand'))} | {_md_cell(r.get('scale'))} | {_md_cell(r.get('quantity',1))} | {_md_cell(r.get('condition'))} | {_md_cell(r.get('estimated_value'))} |\n"
 
                     report += "\n---\n"
                     report += "\n## Selling Resources\n"
@@ -508,16 +596,43 @@ def main():
                     if not items_df.empty:
                         packet += f"Notable Items ({len(items_df)}):\n\n"
                         for _, r in items_df.iterrows():
-                            packet += f"  - {r.get('brand','')} {r.get('item_name','')} (#{r.get('catalog_number','')}) - {r.get('condition','')} - Box: {'Yes' if r.get('has_box') else 'No'}\n"
+                            # Plain-text packet — strip newlines but keep | (not a delimiter here)
+                            def _flat(v):
+                                return str(v or "").replace("\n", " ").replace("\r", " ")
+                            packet += f"  - {_flat(r.get('brand'))} {_flat(r.get('item_name'))} (#{_flat(r.get('catalog_number'))}) - {_flat(r.get('condition'))} - Box: {'Yes' if r.get('has_box') else 'No'}\n"
                     packet += f"\nPlease advise on consignment terms, pickup/shipping options, and estimated timeline.\n"
                     packet += f"\nThank you."
                     st.download_button("Download Packet", packet, "auction_submission.txt", "text/plain")
                     st.text_area("Preview", packet, height=300)
 
             st.markdown("---")
-            if total > 0 and st.button("Clear All"):
-                conn = get_db(); conn.execute("DELETE FROM trains"); conn.commit(); conn.close()
-                st.success("Cleared."); st.rerun()
+            if total > 0:
+                if st.session_state.get("confirm_clear_all"):
+                    st.warning(f"⚠ This will permanently delete all **{total} items**. A backup CSV will be saved to `db/` first.")
+                    cc1, cc2 = st.columns(2)
+                    with cc1:
+                        if st.button("Yes, delete everything", type="primary"):
+                            try:
+                                conn = get_db()
+                                backup_df = pd.read_sql_query("SELECT * FROM trains", conn)
+                                ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                                backup_path = os.path.join(os.path.dirname(DB_PATH), f"backup-{ts}.csv")
+                                backup_df.to_csv(backup_path, index=False)
+                                conn.execute("DELETE FROM trains"); conn.commit(); conn.close()
+                                st.session_state.pop("confirm_clear_all", None)
+                                st.success(f"Cleared. Backup saved to db/{os.path.basename(backup_path)}")
+                                st.rerun()
+                            except Exception as e:
+                                print(f"[clear_all] failed: {e}")
+                                st.error("Clear failed. The collection is unchanged.")
+                    with cc2:
+                        if st.button("Cancel"):
+                            st.session_state.pop("confirm_clear_all", None)
+                            st.rerun()
+                else:
+                    if st.button("Clear All"):
+                        st.session_state["confirm_clear_all"] = True
+                        st.rerun()
 
 if __name__ == "__main__":
     main()

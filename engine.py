@@ -66,12 +66,21 @@ def detect_mime(image_bytes: bytes) -> str:
     return "image/jpeg"
 
 
+MAX_IMAGE_BYTES = 15 * 1024 * 1024  # 15 MB hard cap (app layer caps at 10 MB)
+
+
 def validate_image(image_bytes: bytes | None) -> bytes:
     """Validate image bytes. Raises ValueError if invalid."""
     if not image_bytes:
         raise ValueError("No image data.")
     if len(image_bytes) < 100:
         raise ValueError("Image data too small — likely corrupt.")
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        raise ValueError(f"Image too large ({len(image_bytes) / 1024 / 1024:.1f} MB). Max {MAX_IMAGE_BYTES // 1024 // 1024} MB.")
+    # Reject unrecognized magic bytes — don't silently treat random bytes as JPEG.
+    head = image_bytes[:4]
+    if head not in (b"\x89PNG", b"RIFF", b"GIF8") and image_bytes[:3] != b"\xff\xd8\xff":
+        raise ValueError("Unrecognized image format. Use JPG, PNG, WebP, or GIF.")
     return image_bytes
 
 
@@ -111,7 +120,8 @@ def _call_haiku(image_bytes: bytes, prompt: str, api_key: str, timeout: int) -> 
     )
 
     if not resp.ok:
-        raise RuntimeError(f"Haiku error ({resp.status_code}): {resp.text[:200]}")
+        print(f"[engine.haiku] HTTP {resp.status_code}: {resp.text[:500]}")
+        raise RuntimeError("Vision service unavailable. Try again in a moment.")
 
     data = resp.json()
     return data["content"][0]["text"]
@@ -136,7 +146,8 @@ def _call_gemini(image_bytes: bytes, prompt: str, api_key: str, timeout: int) ->
     )
 
     if not resp.ok:
-        raise RuntimeError(f"Gemini error ({resp.status_code}): {resp.text[:200]}")
+        print(f"[engine.gemini] HTTP {resp.status_code}: {resp.text[:500]}")
+        raise RuntimeError("Vision service unavailable. Try again in a moment.")
 
     data = resp.json()
     return data["candidates"][0]["content"]["parts"][0]["text"]

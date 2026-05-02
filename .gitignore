@@ -1,5 +1,8 @@
-venv/
-__pycache__/
-*.pyc
 db/*.db
 .env
+node_modules
+*.pyc
+__pycache__/
+test-results/
+.venv/
+venv/
