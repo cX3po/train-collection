@@ -27,13 +27,13 @@ test.describe('Trains app — post-bundle smoke', () => {
   test('sign-in page renders', async ({ page }) => {
     await page.goto(BASE_URL);
     await expect(page.getByText('Welcome to the Train Collection')).toBeVisible({ timeout: APP_LOAD_TIMEOUT });
-    await expect(page.getByPlaceholder(/Dad, Phil, Colin/)).toBeVisible();
+    await expect(page.getByRole('textbox', { name: 'Your name' })).toBeVisible();
     // Sign In button is conditional on a non-empty name — see sign-in flow test for that path.
   });
 
   test('sign-in flow → main UI with six tabs', async ({ page }) => {
     await page.goto(BASE_URL);
-    const nameInput = page.getByPlaceholder(/Dad, Phil, Colin/);
+    const nameInput = page.getByRole('textbox', { name: 'Your name' });
     await nameInput.fill('SmokeTest', { timeout: APP_LOAD_TIMEOUT });
     await nameInput.press('Enter');  // Streamlit re-runs only after commit
     const signIn = page.getByRole('button', { name: 'Sign In', exact: true });
@@ -52,7 +52,7 @@ test.describe('Trains app — post-bundle smoke', () => {
 
   test('Ask AX tab — chat input renders', async ({ page }) => {
     await page.goto(BASE_URL);
-    const nameInput = page.getByPlaceholder(/Dad, Phil, Colin/);
+    const nameInput = page.getByRole('textbox', { name: 'Your name' });
     await nameInput.fill('SmokeTest', { timeout: APP_LOAD_TIMEOUT });
     await nameInput.press('Enter');  // Streamlit re-runs only after commit
     const signIn = page.getByRole('button', { name: 'Sign In', exact: true });
@@ -67,7 +67,7 @@ test.describe('Trains app — post-bundle smoke', () => {
 
   test('Clear All requires confirmation (Bundle 3)', async ({ page }) => {
     await page.goto(BASE_URL);
-    const nameInput = page.getByPlaceholder(/Dad, Phil, Colin/);
+    const nameInput = page.getByRole('textbox', { name: 'Your name' });
     await nameInput.fill('SmokeTest', { timeout: APP_LOAD_TIMEOUT });
     await nameInput.press('Enter');  // Streamlit re-runs only after commit
     const signIn = page.getByRole('button', { name: 'Sign In', exact: true });

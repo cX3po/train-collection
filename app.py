@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dad's Train Collection - Streamlit App with AX Chat"""
+"""Train Collection — family Streamlit app with AX chat."""
 import streamlit as st
 import sqlite3
 import os
@@ -13,7 +13,7 @@ import pandas as pd
 import segno
 from datetime import datetime
 
-# Family-deployment limits (this is a 5-user-max app on Phil's Nano)
+# Family-deployment limits (5-user-max app self-hosted on the family server)
 MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB per uploaded photo
 MAX_PHOTOS_PER_SCAN = 10
 SQLITE_BUSY_TIMEOUT_MS = 5000
@@ -35,7 +35,7 @@ def _claude_cli_supports(flag: str) -> bool:
     except Exception:
         return False
 
-# Load API key (used for vision; chat uses CLI under Phil's Max subscription)
+# Load API key (used for vision; chat uses CLI under the operator's Max subscription)
 def load_api_key():
     try:
         key = st.secrets.get("ANTHROPIC_API_KEY", "")
@@ -64,6 +64,33 @@ PHOTOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db", "pho
 # Local photos keep the train-collection repo self-contained.
 PHOTO_JPEG_QUALITY = 85
 PHOTO_MAX_DIMENSION = 1600  # px — downscale longest side to bound disk usage
+# Public base URL the QR labels point at. Env override lets a different
+# Cloudflare hostname or local-test target generate labels that scan
+# back into the right place (Codex 2026-05-16 MEDIUM).
+DEFAULT_PUBLIC_BASE_URL = os.getenv("TRAIN_APP_BASE_URL", "https://train.path-os.net")
+
+
+def _safe_photo_path(rel_or_abs: str) -> str | None:
+    """Resolve a stored photo_path and confirm it stays inside PHOTOS_DIR.
+
+    Codex 2026-05-16 MEDIUM: gallery/focus do os.path.join(app_dir, fphoto)
+    blindly. If a future import/admin edit ever puts an absolute path or
+    `../` traversal in photo_path, the UI would read files outside
+    db/photos. This validator returns the canonical absolute path if and
+    only if it lives inside PHOTOS_DIR; otherwise None.
+    """
+    if not rel_or_abs:
+        return None
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    candidate = os.path.normpath(os.path.join(app_dir, rel_or_abs))
+    photos_dir_abs = os.path.abspath(PHOTOS_DIR)
+    try:
+        if os.path.commonpath([candidate, photos_dir_abs]) != photos_dir_abs:
+            return None
+    except ValueError:
+        # Mixed drive on Windows / completely unrelated paths
+        return None
+    return candidate if os.path.exists(candidate) else None
 
 
 def _md_cell(value):
@@ -124,6 +151,51 @@ def init_db():
     _DB_INITIALIZED = True
 
 
+FAMILY_CONFIG_PATH = os.path.expanduser("~/axiom/config/family_members.json")
+IDENTITY_CONFIG_PATH = os.path.expanduser("~/axiom/config/identity.json")
+_FAMILY_HINTS_CACHE: dict | None = None
+
+
+def _load_family_hints() -> dict:
+    """Pull display-only hints (collection title + sign-in placeholder) from
+    the family config when present. Falls back to generic strings so the
+    train app still runs standalone outside the axiom directory tree.
+
+    Codex 2026-05-16 MEDIUM PRIVACY: previous versions hardcoded
+    Dad/Phil/Colin in user-facing copy. The hints are now optional —
+    deployer can leave them empty for a fully generic install.
+    """
+    global _FAMILY_HINTS_CACHE
+    if _FAMILY_HINTS_CACHE is not None:
+        return _FAMILY_HINTS_CACHE
+    hints = {
+        "title": "Train Collection",
+        "placeholder": "Your name",
+    }
+    try:
+        if os.path.exists(FAMILY_CONFIG_PATH):
+            import json as _json
+            data = _json.loads(open(FAMILY_CONFIG_PATH).read())
+            names = [m.get("name", "").split()[0]
+                     for m in data.get("members", {}).values()
+                     if m.get("name")]
+            if names:
+                hints["placeholder"] = "e.g. " + ", ".join(names[:3])
+    except Exception as e:
+        print(f"[family_hints] non-fatal load issue: {e}")
+    try:
+        if os.path.exists(IDENTITY_CONFIG_PATH):
+            import json as _json
+            ident = _json.loads(open(IDENTITY_CONFIG_PATH).read())
+            t = ident.get("train_app_title") or ident.get("display_name", "")
+            if t:
+                hints["title"] = f"{t} Train Collection" if "Train" not in t else t
+    except Exception:
+        pass
+    _FAMILY_HINTS_CACHE = hints
+    return hints
+
+
 PRICE_SEED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db", "greenberg_seed.json")
 _PRICE_SEED_CACHE: dict | None = None
 
@@ -150,20 +222,39 @@ def _load_price_seed() -> dict:
 
 def _normalize_catalog(catalog: str) -> str:
     """Normalize a catalog number for matching. Strips whitespace, uppercases,
-    and removes common punctuation that varies between vision OCR / Greenberg's
-    notation (`2333-100`, `2333`, `#2333` all become `2333`)."""
+    and removes leading punctuation. Returns the FULL normalized string —
+    callers that want a Lionel-style prefix match should request it
+    explicitly via lookup_price_seed's two-pass strategy.
+
+    Codex 2026-05-16: the previous implementation split on '-' which collapsed
+    MTH catalogs like '20-3030' down to '20', making every MTH 20-xxxx item
+    auto-match the 20-3030 seed and get the wrong value. Manufacturers like
+    Lionel postwar use bare numerics (2333, 726) and sometimes -suffix
+    variants (2333-100); MTH uses dashes meaningfully (20-3030 is the full
+    catalog). Returning the full string and letting lookup_price_seed do
+    a two-pass (exact then trimmed) is the only safe normalization.
+    """
     if not catalog:
         return ""
     s = str(catalog).strip().upper()
-    # Trim leading # or 'NO.' prefixes
     for prefix in ("#", "NO.", "NO ", "CAT.", "CAT "):
         if s.startswith(prefix):
             s = s[len(prefix):].strip()
-    # Take portion before a dash/space (so 2333-100 → 2333)
-    for sep in ("-", " ", "/"):
-        if sep in s:
-            s = s.split(sep)[0]
     return s
+
+
+def _catalog_prefix(catalog: str) -> str:
+    """Return the leading numeric/alpha-block of a Lionel-style variant.
+    `2333-100` -> `2333`. Returns empty for catalogs without a dash so MTH
+    `20-3030` is NOT collapsed here — that path is exact-match only.
+    """
+    s = _normalize_catalog(catalog)
+    if "-" not in s:
+        return ""
+    head = s.split("-", 1)[0]
+    # Only use prefix matching when the head looks Lionel-shaped (>= 3 chars).
+    # MTH's `20-xxxx` heads (2 chars) are NOT eligible — protects 20-3030.
+    return head if len(head) >= 3 else ""
 
 
 def lookup_price_seed(brand: str, catalog: str) -> dict | None:
@@ -171,22 +262,40 @@ def lookup_price_seed(brand: str, catalog: str) -> dict | None:
 
     Brand matching is loose (case-insensitive substring) since vision OCR
     returns "Lionel Corporation" / "lionel" / "LIONEL" inconsistently.
-    Catalog matching is exact after normalization.
+
+    Catalog matching is two-pass:
+      1. Exact normalized match (handles bare numerics + MTH 20-3030).
+      2. Lionel-style prefix match (`2333-100` against seed `2333`), but
+         ONLY if the head is >= 3 chars — protects MTH 2-digit prefixes.
     """
-    target_cat = _normalize_catalog(catalog)
-    if not target_cat:
+    target_full = _normalize_catalog(catalog)
+    target_prefix = _catalog_prefix(catalog)
+    if not target_full:
         return None
     target_brand = (brand or "").strip().lower()
+
+    def _brand_matches(entry):
+        if not target_brand:
+            return True
+        entry_brand = (entry.get("brand") or "").strip().lower()
+        if not entry_brand:
+            return True
+        return entry_brand in target_brand or target_brand in entry_brand
+
     seed = _load_price_seed()
+    # Pass 1: exact match on the full normalized catalog.
     for entry in seed.get("items", []):
-        if _normalize_catalog(entry.get("catalog_number", "")) != target_cat:
+        if _normalize_catalog(entry.get("catalog_number", "")) != target_full:
             continue
-        # Empty target brand → match on catalog alone
-        if target_brand:
-            entry_brand = (entry.get("brand") or "").strip().lower()
-            if entry_brand and entry_brand not in target_brand and target_brand not in entry_brand:
+        if _brand_matches(entry):
+            return entry
+    # Pass 2: prefix match for Lionel-style variants only.
+    if target_prefix:
+        for entry in seed.get("items", []):
+            if _normalize_catalog(entry.get("catalog_number", "")) != target_prefix:
                 continue
-        return entry
+            if _brand_matches(entry):
+                return entry
     return None
 
 
@@ -402,7 +511,7 @@ def main():
     if not st.session_state.user_name:
         st.markdown("## Welcome to the Train Collection")
         st.markdown("**Sign in so AX knows who you are:**")
-        name = st.text_input("Your name", placeholder="e.g. Dad, Phil, Colin")
+        name = st.text_input("Your name", placeholder=_load_family_hints()["placeholder"])
         if name and st.button("Sign In", type="primary"):
             st.session_state.user_name = name
             st.query_params["user"] = name
@@ -411,7 +520,7 @@ def main():
     user_name = st.session_state.user_name
 
     if "app_title" not in st.session_state:
-        st.session_state.app_title = "Dad's Train Collection"
+        st.session_state.app_title = _load_family_hints()["title"]
     st.title(st.session_state.app_title)
 
     init_db()
@@ -466,9 +575,8 @@ def main():
                     )
                     fcols = st.columns([1, 2])
                     with fcols[0]:
-                        app_dir = os.path.dirname(os.path.abspath(__file__))
-                        photo_abs = os.path.join(app_dir, fphoto) if fphoto else ""
-                        if photo_abs and os.path.exists(photo_abs):
+                        photo_abs = _safe_photo_path(fphoto)
+                        if photo_abs:
                             st.image(photo_abs, use_container_width=True)
                         else:
                             st.caption(":camera_with_flash: _no photo on file_")
@@ -552,16 +660,14 @@ def main():
                 # Bundle 10 Gallery view — card grid showing the saved photo + key
                 # metadata for each item. Read-only by design (editing happens in
                 # Table view) so it stays fast even at 1000+ items.
-                app_dir = os.path.dirname(os.path.abspath(__file__))
                 cards_per_row = 3
                 rows = df.to_dict("records")
                 for i in range(0, len(rows), cards_per_row):
                     cols = st.columns(cards_per_row)
                     for j, row in enumerate(rows[i:i+cards_per_row]):
                         with cols[j]:
-                            photo_rel = row.get("photo_path") or ""
-                            photo_abs = os.path.join(app_dir, photo_rel) if photo_rel else ""
-                            if photo_abs and os.path.exists(photo_abs):
+                            photo_abs = _safe_photo_path(row.get("photo_path") or "")
+                            if photo_abs:
                                 st.image(photo_abs, use_container_width=True)
                             else:
                                 st.caption(":camera_with_flash: _no photo_")
@@ -683,18 +789,40 @@ def main():
         if scan_state and scan_state.get("items"):
             items = scan_state["items"]
             images = scan_state.get("images", [])
-            added = scan_state.get("added", [False] * len(items))
+            # Codex 2026-05-16: normalize `added` shape on read so a stale
+            # session_state shape (e.g. after a hot reload mid-add) cannot
+            # raise IndexError in the loops below.
+            raw_added = scan_state.get("added", [])
+            if not isinstance(raw_added, list):
+                raw_added = []
+            added = [bool(raw_added[i]) if i < len(raw_added) else False
+                     for i in range(len(items))]
+            # Persist the normalized shape back so subsequent renders use it.
+            st.session_state["scan_results"]["added"] = added
             remaining = sum(1 for a in added if not a)
 
-            st.success(
-                f"Found **{len(items)} item(s)** across {len(images)} photo(s) "
-                f"— {remaining} not yet added."
-            )
+            # Codex 2026-05-16 HIGH: make it unmistakable that scan results are
+            # NOT yet saved. Colin reported the previous green banner ("Found N
+            # items!") felt like confirmation, and he closed the browser before
+            # clicking Add — losing the work. The warning + explicit hint +
+            # primary button anchored at the TOP of the results block close
+            # that loop.
+            if remaining > 0:
+                st.warning(
+                    f"⚠️ **Found {len(items)} item(s) across {len(images)} photo(s) "
+                    f"— NOT SAVED YET.** Click the button below to keep them. "
+                    f"If you close this tab now, this scan will be lost."
+                )
+            else:
+                st.success(
+                    f"✅ All {len(items)} item(s) from this scan are saved. "
+                    f"Use **Clear scan / start over** when you're ready for the next batch."
+                )
 
             btn_col1, btn_col2 = st.columns([1, 1])
             with btn_col1:
                 if remaining > 0 and st.button(
-                    f"Add ALL {remaining} to Collection",
+                    f"\U0001f4be Save ALL {remaining} to Collection",
                     type="primary",
                     key="add_all_trains",
                 ):
@@ -921,11 +1049,58 @@ def main():
                         msg += f" — {seeded} auto-priced from the price seed"
                     st.success(msg); st.rerun()
 
+            # Codex 2026-05-16 LOW: wire the upload — previously the uploader
+            # read the file but only said "use CSV import in future update,"
+            # which Colin would reasonably read as "import is broken." Now we
+            # detect tab vs comma delimiter from the file content and run the
+            # same row-loop as paste-import, including the price-seed lookup.
             uploaded = st.file_uploader("Or upload CSV/TSV", type=["csv","tsv","txt"])
             if uploaded:
                 content = uploaded.read().decode('utf-8', errors='replace')
-                # Same import logic
-                st.info("File uploaded - paste contents above or use CSV import in future update.")
+                # Pick the delimiter that yields the most consistent column
+                # count. CSV detect heuristic: tab if any line has a tab.
+                sep = "\t" if any("\t" in ln for ln in content.splitlines()[:5]) else ","
+                if st.button("Import uploaded file", type="primary", key="import_uploaded"):
+                    conn = get_db(); count = 0; seeded = 0
+                    for line in content.strip().split('\n'):
+                        if not line.strip():
+                            continue
+                        parts = line.split(sep)
+                        while len(parts) < 12:
+                            parts.append("")
+                        try:
+                            qty = int(parts[6].strip() or "1")
+                        except ValueError:
+                            qty = 1
+                        row_val = parts[9].strip()
+                        row_notes = parts[11].strip()
+                        if not row_val:
+                            sv, sn = _apply_price_seed({
+                                "brand": parts[1].strip(),
+                                "catalog_number": parts[5].strip(),
+                                "value_notes": row_notes,
+                            })
+                            if sv:
+                                row_val = sv; row_notes = sn; seeded += 1
+                        conn.execute("""INSERT INTO trains (item_name,brand,scale,era,item_type,
+                            catalog_number,quantity,condition,has_box,estimated_value,location,notes,is_notable)
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (parts[0].strip(),parts[1].strip(),parts[2].strip(),parts[3].strip(),
+                             parts[4].strip(),parts[5].strip(),qty,parts[7].strip(),
+                             1 if parts[8].strip().lower() in ("yes","1","true","y") else 0,
+                             row_val,parts[10].strip(),row_notes,
+                             1 if is_notable(parts[0].strip(),parts[1].strip(),parts[3].strip()) else 0))
+                        count += 1
+                    conn.commit(); conn.close()
+                    msg = f"Imported {count} items from {uploaded.name}"
+                    if seeded:
+                        msg += f" — {seeded} auto-priced from the price seed"
+                    st.success(msg); st.rerun()
+                else:
+                    st.caption(
+                        f"Detected {'tab' if sep == chr(9) else 'comma'}-separated. "
+                        f"Click **Import uploaded file** to load."
+                    )
 
         with exp_col:
             st.markdown("### Export")
@@ -998,7 +1173,7 @@ def main():
                         "SELECT id, item_name, brand, catalog_number FROM trains "
                         "ORDER BY brand, item_name", conn)
                     conn.close()
-                    base_url = "https://train.path-os.net"
+                    base_url = DEFAULT_PUBLIC_BASE_URL
                     # Avery 5160 stylesheet — 1" tall, 2.625" wide, 30 per page.
                     css = """
                     <style>
