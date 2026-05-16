@@ -1061,11 +1061,23 @@ def main():
                 # count. CSV detect heuristic: tab if any line has a tab.
                 sep = "\t" if any("\t" in ln for ln in content.splitlines()[:5]) else ","
                 if st.button("Import uploaded file", type="primary", key="import_uploaded"):
-                    conn = get_db(); count = 0; seeded = 0
-                    for line in content.strip().split('\n'):
-                        if not line.strip():
+                    conn = get_db(); count = 0; seeded = 0; skipped_header = False
+                    # Codex 2026-05-16 MED: use csv.reader for both CSV and TSV
+                    # so quoted fields with commas/newlines parse correctly.
+                    # Also detect + skip a header row by sniffing the first cell.
+                    import csv as _csv
+                    reader = _csv.reader(io.StringIO(content), delimiter=sep)
+                    HEADER_HINTS = {
+                        "name", "item_name", "item name",
+                        "brand", "scale", "era", "type", "item_type",
+                        "catalog", "catalog_number", "catalog#", "cat#",
+                    }
+                    for row_idx, parts in enumerate(reader):
+                        if not parts or all(not (p or "").strip() for p in parts):
                             continue
-                        parts = line.split(sep)
+                        if row_idx == 0 and (parts[0] or "").strip().lower() in HEADER_HINTS:
+                            skipped_header = True
+                            continue
                         while len(parts) < 12:
                             parts.append("")
                         try:
@@ -1095,6 +1107,8 @@ def main():
                     msg = f"Imported {count} items from {uploaded.name}"
                     if seeded:
                         msg += f" — {seeded} auto-priced from the price seed"
+                    if skipped_header:
+                        msg += " (skipped header row)"
                     st.success(msg); st.rerun()
                 else:
                     st.caption(
@@ -1107,8 +1121,39 @@ def main():
             if total > 0:
                 conn = get_db()
                 all_df = pd.read_sql_query("SELECT * FROM trains ORDER BY brand, item_name", conn); conn.close()
+                # Codex 2026-05-16 MED: full-backup CSV included `id` first +
+                # extra schema columns, which the 12-column importer would
+                # silently misalign. Offer TWO downloads: a re-import-safe
+                # CSV (12-column paste-format) AND a full-backup CSV (all
+                # columns including id + photo_path).
+                IMPORT_COLS = ["item_name", "brand", "scale", "era", "item_type",
+                               "catalog_number", "quantity", "condition", "has_box",
+                               "estimated_value", "location", "notes"]
+                import_df = all_df.reindex(columns=IMPORT_COLS, fill_value="").copy()
+                # has_box is stored as 0/1 int — render as Yes/No so a human
+                # editing the export in Excel doesn't see opaque numbers.
+                import_df["has_box"] = import_df["has_box"].apply(
+                    lambda v: "Yes" if str(v).strip() in ("1", "True", "yes", "true", "Yes") else "No"
+                )
+                import_csv_buf = io.StringIO()
+                import_df.to_csv(import_csv_buf, index=False)
+                st.download_button(
+                    "Download CSV (re-importable)",
+                    import_csv_buf.getvalue(),
+                    "train_collection.csv",
+                    "text/csv",
+                    help="12-column format that matches the Import box above. "
+                         "Edit in Excel and re-upload to update your collection.",
+                )
                 csv_buf = io.StringIO(); all_df.to_csv(csv_buf, index=False)
-                st.download_button("Download CSV", csv_buf.getvalue(), "train_collection.csv", "text/csv")
+                st.download_button(
+                    "Download CSV (full backup, all columns)",
+                    csv_buf.getvalue(),
+                    "train_collection_backup.csv",
+                    "text/csv",
+                    help="Includes id + photo_path + every column. Use for "
+                         "archival/safety, not for re-import.",
+                )
                 json_str = all_df.to_json(orient="records", indent=2)
                 st.download_button("Download JSON", json_str, "train_collection.json", "application/json")
 
