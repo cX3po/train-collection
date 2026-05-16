@@ -4,10 +4,13 @@ import streamlit as st
 import sqlite3
 import os
 import io
+import html as _html
 import shutil
 import subprocess
+import urllib.parse
 import uuid
 import pandas as pd
+import segno
 from datetime import datetime
 
 # Family-deployment limits (this is a 5-user-max app on Phil's Nano)
@@ -52,6 +55,15 @@ if API_KEY: os.environ["ANTHROPIC_API_KEY"] = API_KEY
 
 CLAUDE_BIN = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db", "trains.db")
+PHOTOS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db", "photos")
+# Why local-not-axiom-media-engine (Bundle 10 reuse decision 2026-05-16):
+# axiom's engines/media/engine.py would be the "right" backend, but the train
+# app is a standalone Streamlit process — adopting it requires either running
+# inside the axiom venv or per-upload HTTP calls to axiom-server. Both break
+# the app's runs-standalone property for a 5-user-max family deployment.
+# Local photos keep the train-collection repo self-contained.
+PHOTO_JPEG_QUALITY = 85
+PHOTO_MAX_DIMENSION = 1600  # px — downscale longest side to bound disk usage
 
 
 def _md_cell(value):
@@ -88,6 +100,7 @@ def init_db():
     global _DB_INITIALIZED
     if _DB_INITIALIZED:
         return
+    os.makedirs(PHOTOS_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=5.0)
     c = conn.cursor()
     c.execute("PRAGMA journal_mode=WAL")
@@ -101,8 +114,164 @@ def init_db():
         location TEXT, description TEXT,
         is_notable INTEGER DEFAULT 0, notes TEXT, last_updated TEXT
     )""")
+    # Bundle 10 migration: add photo_path if missing. ALTER TABLE is idempotent-
+    # by-introspection — check existing columns, only add if absent. Doing it
+    # here keeps the migration co-located with the schema definition.
+    existing_cols = {row[1] for row in c.execute("PRAGMA table_info(trains)").fetchall()}
+    if "photo_path" not in existing_cols:
+        c.execute("ALTER TABLE trains ADD COLUMN photo_path TEXT")
     conn.commit(); conn.close()
     _DB_INITIALIZED = True
+
+
+PRICE_SEED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db", "greenberg_seed.json")
+_PRICE_SEED_CACHE: dict | None = None
+
+
+def _load_price_seed() -> dict:
+    """Lazy-loaded, in-process cached price-seed reference.
+
+    Returns the parsed JSON. Cached because lookup happens per-item-add and the
+    file is small but parsing is non-trivial. Cache is None-checked on each call
+    so a hot-reload doesn't get stuck on a stale parse.
+    """
+    global _PRICE_SEED_CACHE
+    if _PRICE_SEED_CACHE is not None:
+        return _PRICE_SEED_CACHE
+    try:
+        with open(PRICE_SEED_PATH, "r") as f:
+            import json as _json
+            _PRICE_SEED_CACHE = _json.load(f)
+    except Exception as e:
+        print(f"[price_seed] load failed: {e}")
+        _PRICE_SEED_CACHE = {"items": []}
+    return _PRICE_SEED_CACHE
+
+
+def _normalize_catalog(catalog: str) -> str:
+    """Normalize a catalog number for matching. Strips whitespace, uppercases,
+    and removes common punctuation that varies between vision OCR / Greenberg's
+    notation (`2333-100`, `2333`, `#2333` all become `2333`)."""
+    if not catalog:
+        return ""
+    s = str(catalog).strip().upper()
+    # Trim leading # or 'NO.' prefixes
+    for prefix in ("#", "NO.", "NO ", "CAT.", "CAT "):
+        if s.startswith(prefix):
+            s = s[len(prefix):].strip()
+    # Take portion before a dash/space (so 2333-100 → 2333)
+    for sep in ("-", " ", "/"):
+        if sep in s:
+            s = s.split(sep)[0]
+    return s
+
+
+def lookup_price_seed(brand: str, catalog: str) -> dict | None:
+    """Return the seed entry for a (brand, catalog) pair, or None.
+
+    Brand matching is loose (case-insensitive substring) since vision OCR
+    returns "Lionel Corporation" / "lionel" / "LIONEL" inconsistently.
+    Catalog matching is exact after normalization.
+    """
+    target_cat = _normalize_catalog(catalog)
+    if not target_cat:
+        return None
+    target_brand = (brand or "").strip().lower()
+    seed = _load_price_seed()
+    for entry in seed.get("items", []):
+        if _normalize_catalog(entry.get("catalog_number", "")) != target_cat:
+            continue
+        # Empty target brand → match on catalog alone
+        if target_brand:
+            entry_brand = (entry.get("brand") or "").strip().lower()
+            if entry_brand and entry_brand not in target_brand and target_brand not in entry_brand:
+                continue
+        return entry
+    return None
+
+
+def _apply_price_seed(d: dict) -> tuple[str, str]:
+    """Compute (estimated_value, value_notes) for a scan-result dict,
+    falling back to the price seed when the vision engine did not provide
+    a value. Returns the existing value untouched if already set.
+    """
+    existing_val = d.get("estimated_value")
+    if existing_val not in (None, "", 0, "0"):
+        return str(existing_val), d.get("value_notes", "") or ""
+    match = lookup_price_seed(d.get("brand", ""), d.get("catalog_number", ""))
+    if not match:
+        return "", d.get("value_notes", "") or ""
+    mid = int((match["low"] + match["high"]) / 2)
+    note_existing = d.get("value_notes", "") or ""
+    seed_note = (
+        f"~${match['low']}-${match['high']} from price seed "
+        f"({match.get('era', '')}). {match.get('notes', '')}"
+    ).strip()
+    combined = f"{note_existing} | {seed_note}" if note_existing else seed_note
+    return str(mid), combined
+
+
+def _label_code(train_id: int) -> str:
+    """DASH-style stable code for a train row. Format: T-NNNN (zero-padded
+    so labels sort nicely; widens to 5 digits automatically past 9999)."""
+    width = max(4, len(str(train_id)))
+    return f"T-{train_id:0{width}d}"
+
+
+def _qr_svg_for(train_id: int, base_url: str, user: str) -> str:
+    """Return an inline SVG QR for a single train item.
+
+    Encodes a URL that opens the app signed-in as `user` and focuses the
+    target item (the app reads ?focus=N to highlight on landing). Inline
+    SVG so the printable label page is single-file — no external image
+    requests when Dad's printer is offline.
+
+    Codex 2026-05-16: use urllib.parse.quote so usernames with `&`, `?`,
+    `=`, `#` etc don't corrupt the URL.
+    """
+    safe_user = urllib.parse.quote(user, safe="")
+    url = f"{base_url.rstrip('/')}/?user={safe_user}&focus={train_id}"
+    qr = segno.make(url, error="m")
+    buf = io.StringIO()
+    qr.save(buf, kind="svg", scale=4, border=0, xmldecl=False, svgns=False, omithw=True)
+    return buf.getvalue()
+
+
+def _save_train_photo(img_bytes: bytes, train_id: int) -> str | None:
+    """Compress + persist an uploaded photo for a train row.
+
+    Returns the relative path stored in the DB (or None on failure).
+    Failure is non-fatal — the train row exists with photo_path NULL and
+    the UI shows the row without a thumbnail. Saving the photo should
+    never block adding the item.
+    """
+    try:
+        from PIL import Image
+        import io as _io
+        img = Image.open(_io.BytesIO(img_bytes))
+        # Normalize EXIF orientation so phone photos don't display sideways.
+        try:
+            from PIL import ImageOps
+            img = ImageOps.exif_transpose(img)
+        except Exception:
+            pass
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        # Downscale the longest side. Bounds disk usage and keeps the
+        # Collection tab responsive even at 1000+ items.
+        w, h = img.size
+        longest = max(w, h)
+        if longest > PHOTO_MAX_DIMENSION:
+            scale = PHOTO_MAX_DIMENSION / longest
+            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        out_path = os.path.join(PHOTOS_DIR, f"{train_id}.jpg")
+        img.save(out_path, format="JPEG", quality=PHOTO_JPEG_QUALITY, optimize=True)
+        # Store path relative to the app dir so the DB stays portable if
+        # someone copies the train-collection repo to a different machine.
+        return os.path.relpath(out_path, os.path.dirname(os.path.abspath(__file__)))
+    except Exception as e:
+        print(f"[photo_save] failed for train_id={train_id}: {e}")
+        return None
 
 def get_db():
     init_db()
@@ -224,15 +393,19 @@ PHOTO_GUIDE_SVG = """
 def main():
     st.set_page_config(page_title="Train Collection", page_icon="\U0001f682", layout="wide")
 
-    # Family login
+    # Family login — query-string carries identity so a bookmarked link
+    # (https://train.path-os.net/?user=Dad) signs Dad in automatically.
+    # Closes Bundle 9 Bug 2: "when he logs back on he doesn't know where it's at."
     if "user_name" not in st.session_state:
-        st.session_state.user_name = ""
+        qp_user = st.query_params.get("user", "")
+        st.session_state.user_name = qp_user.strip() if isinstance(qp_user, str) else ""
     if not st.session_state.user_name:
         st.markdown("## Welcome to the Train Collection")
         st.markdown("**Sign in so AX knows who you are:**")
         name = st.text_input("Your name", placeholder="e.g. Dad, Phil, Colin")
         if name and st.button("Sign In", type="primary"):
             st.session_state.user_name = name
+            st.query_params["user"] = name
             st.rerun()
         st.stop()
     user_name = st.session_state.user_name
@@ -249,12 +422,14 @@ def main():
     with_values = conn.execute("SELECT COUNT(*) FROM trains WHERE estimated_value!='' AND estimated_value IS NOT NULL").fetchone()[0]
     brands = [r[0] for r in conn.execute("SELECT DISTINCT brand FROM trains WHERE brand!='' ORDER BY brand").fetchall()]
     scales = [r[0] for r in conn.execute("SELECT DISTINCT scale FROM trains WHERE scale!='' ORDER BY scale").fetchall()]
+    last_row = conn.execute("SELECT brand, item_name, last_updated FROM trains WHERE last_updated IS NOT NULL AND last_updated!='' ORDER BY last_updated DESC LIMIT 1").fetchone()
     conn.close()
 
     with st.sidebar:
         st.markdown(f"**Signed in as:** {user_name}")
         if st.button("Sign Out", key="signout"):
             st.session_state.user_name = ""
+            st.query_params.clear()
             st.rerun()
         st.markdown("---")
         new_title = st.text_input("Collection Title", st.session_state.app_title)
@@ -268,6 +443,81 @@ def main():
         st.markdown("---")
         st.markdown(f"**Items:** {total:,} | **Pieces:** {total_qty:,}")
         st.markdown(f"**Notable:** {notable:,} | **Priced:** {with_values:,}")
+
+    # Bundle 11 focus handler — when a label-sheet QR is scanned, the QR URL
+    # carries `?focus=N`. Surface the matching item up front so the scan-to-app
+    # flow has a clear payoff (the user lands on the app AND sees the item).
+    focus_id_raw = st.query_params.get("focus", "")
+    if focus_id_raw:
+        try:
+            focus_id = int(focus_id_raw)
+            conn_f = get_db()
+            focus_row = conn_f.execute(
+                "SELECT id, item_name, brand, scale, era, catalog_number, "
+                "condition, estimated_value, photo_path FROM trains WHERE id=?",
+                (focus_id,),
+            ).fetchone()
+            conn_f.close()
+            if focus_row:
+                fid, fname, fbrand, fscale, fera, fcatn, fcond, fval, fphoto = focus_row
+                with st.container(border=True):
+                    st.markdown(
+                        f"### \U0001f516 Scanned label — **{_label_code(fid)}**"
+                    )
+                    fcols = st.columns([1, 2])
+                    with fcols[0]:
+                        app_dir = os.path.dirname(os.path.abspath(__file__))
+                        photo_abs = os.path.join(app_dir, fphoto) if fphoto else ""
+                        if photo_abs and os.path.exists(photo_abs):
+                            st.image(photo_abs, use_container_width=True)
+                        else:
+                            st.caption(":camera_with_flash: _no photo on file_")
+                    with fcols[1]:
+                        st.markdown(f"**{fname or 'Unknown'}**")
+                        meta_bits = [b for b in [fbrand, fscale, fera] if b]
+                        if meta_bits:
+                            st.markdown(" · ".join(meta_bits))
+                        if fcatn:
+                            st.caption(f"Catalog #: {fcatn}")
+                        if fcond:
+                            st.caption(f"Condition: {fcond}")
+                        if fval:
+                            st.caption(f"Est. value: ${fval}")
+                    if st.button("Clear focus", key="clear_focus"):
+                        # Drop the focus param so a refresh doesn't reopen the
+                        # banner. Preserves user= so the sign-in stays warm.
+                        st.query_params.pop("focus", None)
+                        st.rerun()
+            else:
+                st.warning(
+                    f"Scanned label was for item ID {focus_id}, but no matching "
+                    f"row exists. The item may have been deleted."
+                )
+        except (TypeError, ValueError):
+            # Bad focus value — silently ignore; the welcome card below still renders.
+            pass
+
+    # Welcome-back card — first thing the user sees after sign-in so they always
+    # know where they left off. Closes Bundle 9 Bug 2.
+    if total > 0:
+        last_when = "recently"
+        last_item = "an item"
+        if last_row and last_row[2]:
+            try:
+                last_when = datetime.fromisoformat(last_row[2]).strftime("%B %d")
+            except (ValueError, TypeError):
+                pass
+            last_item = f"{(last_row[0] or '').strip()} {(last_row[1] or '').strip()}".strip() or "an item"
+        st.success(
+            f"\U0001f44b Welcome back, **{user_name}** — you have **{total:,} items** saved "
+            f"({total_qty:,} pieces, {notable:,} notable). "
+            f"Last added: **{last_item}** on {last_when}."
+        )
+    else:
+        st.info(
+            f"\U0001f44b Welcome, **{user_name}**. Your collection is empty — "
+            f"head to **Scan Items** to photograph your first train."
+        )
 
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "Collection", "Scan Items", "Ask AX", "Sell Items", "Stats", "Import/Export"
@@ -291,28 +541,64 @@ def main():
             if total == 0: st.info("No items yet. Use Scan Items to photograph your trains, or Import/Export to paste data.")
             else: st.info("No items match filters.")
         else:
-            st.markdown(f"**{len(df)} items** | Edit directly, then Save.")
-            edit_cols = ["id","item_name","brand","scale","era","item_type","catalog_number",
-                        "quantity","condition","has_box","estimated_value","location","notes"]
-            avail = [c for c in edit_cols if c in df.columns]
-            col_config = {"id": st.column_config.NumberColumn("ID", disabled=True, width="small"),
-                         "has_box": st.column_config.CheckboxColumn("Box?")}
-            edited = st.data_editor(df[avail], column_config=col_config,
-                                   use_container_width=True, height=600, num_rows="dynamic")
-            if st.button("Save Changes", type="primary"):
-                conn = get_db()
-                for _, row in edited.iterrows():
-                    if pd.notna(row.get("id")):
-                        conn.execute("""UPDATE trains SET item_name=?,brand=?,scale=?,era=?,item_type=?,
-                            catalog_number=?,quantity=?,condition=?,has_box=?,estimated_value=?,
-                            location=?,notes=?,last_updated=? WHERE id=?""",
-                            (row.get("item_name",""),row.get("brand",""),row.get("scale",""),
-                             row.get("era",""),row.get("item_type",""),row.get("catalog_number",""),
-                             row.get("quantity",1),row.get("condition",""),
-                             1 if row.get("has_box") else 0,
-                             row.get("estimated_value",""),row.get("location",""),
-                             row.get("notes",""),datetime.now().isoformat(),row["id"]))
-                conn.commit(); conn.close(); st.success("Saved!")
+            view_mode = st.radio(
+                "View", ["Table (edit)", "Gallery (with photos)"],
+                horizontal=True, key="collection_view_mode",
+                label_visibility="collapsed",
+            )
+            st.markdown(f"**{len(df)} items**")
+
+            if view_mode.startswith("Gallery"):
+                # Bundle 10 Gallery view — card grid showing the saved photo + key
+                # metadata for each item. Read-only by design (editing happens in
+                # Table view) so it stays fast even at 1000+ items.
+                app_dir = os.path.dirname(os.path.abspath(__file__))
+                cards_per_row = 3
+                rows = df.to_dict("records")
+                for i in range(0, len(rows), cards_per_row):
+                    cols = st.columns(cards_per_row)
+                    for j, row in enumerate(rows[i:i+cards_per_row]):
+                        with cols[j]:
+                            photo_rel = row.get("photo_path") or ""
+                            photo_abs = os.path.join(app_dir, photo_rel) if photo_rel else ""
+                            if photo_abs and os.path.exists(photo_abs):
+                                st.image(photo_abs, use_container_width=True)
+                            else:
+                                st.caption(":camera_with_flash: _no photo_")
+                            name = (row.get("item_name") or "Unknown").strip()
+                            brand = (row.get("brand") or "").strip()
+                            val = (row.get("estimated_value") or "").strip()
+                            tid = int(row['id'])
+                            st.markdown(f"**{name}**  \n{brand} · `{_label_code(tid)}`")
+                            if val:
+                                st.caption(f"Est. value: ${val}")
+
+            else:
+                edit_cols = ["id","item_name","brand","scale","era","item_type","catalog_number",
+                            "quantity","condition","has_box","estimated_value","location","notes"]
+                avail = [c for c in edit_cols if c in df.columns]
+                col_config = {"id": st.column_config.NumberColumn("ID", disabled=True, width="small"),
+                             "has_box": st.column_config.CheckboxColumn("Box?")}
+                # Claude 2026-05-16: num_rows="dynamic" let users add rows in
+                # the table, but the save path only UPDATEs by id — new rows
+                # had NaN id and were silently dropped (data loss). Pin to
+                # "fixed" since the intended add path is the Scan Items tab.
+                edited = st.data_editor(df[avail], column_config=col_config,
+                                       use_container_width=True, height=600, num_rows="fixed")
+                if st.button("Save Changes", type="primary"):
+                    conn = get_db()
+                    for _, row in edited.iterrows():
+                        if pd.notna(row.get("id")):
+                            conn.execute("""UPDATE trains SET item_name=?,brand=?,scale=?,era=?,item_type=?,
+                                catalog_number=?,quantity=?,condition=?,has_box=?,estimated_value=?,
+                                location=?,notes=?,last_updated=? WHERE id=?""",
+                                (row.get("item_name",""),row.get("brand",""),row.get("scale",""),
+                                 row.get("era",""),row.get("item_type",""),row.get("catalog_number",""),
+                                 row.get("quantity",1),row.get("condition",""),
+                                 1 if row.get("has_box") else 0,
+                                 row.get("estimated_value",""),row.get("location",""),
+                                 row.get("notes",""),datetime.now().isoformat(),row["id"]))
+                    conn.commit(); conn.close(); st.success("Saved!")
 
     # ── Scan Items ──
     with tab2:
@@ -349,6 +635,10 @@ def main():
                     total_mb = sum(p.size for p in photos) / 1024 / 1024
                     st.caption(f"{len(photos)} photo(s) selected · {total_mb:.1f} MB total")
 
+        # Bundle 9 fix: scan TRIGGER stores results in session_state; RENDER
+        # reads from session_state below. This survives Streamlit reruns so
+        # "Add This One" / "Add ALL" no longer make the results vanish — that
+        # was the "can only save 3 pictures" symptom Dad reported.
         if photos and st.button("Scan All Photos", type="primary"):
             if not API_KEY:
                 st.error("No API key configured.")
@@ -358,77 +648,25 @@ def main():
                     from train_prompts import TRAIN_IDENTIFIER, TRAIN_ROOM_SCAN
                     engine = VisionEngine(provider="haiku")
 
-                    all_results = []
-                    all_images = []
-
-                    # Process each photo
+                    new_items = []
+                    new_images = []
                     for i, photo in enumerate(photos):
                         img_bytes = photo.read()
-                        all_images.append(img_bytes)
+                        new_images.append(img_bytes)
                         prompt = TRAIN_ROOM_SCAN if scan_type.startswith("Shelf") else TRAIN_IDENTIFIER
-
                         with st.spinner(f"Scanning photo {i+1} of {len(photos)}..."):
                             results = engine.analyze(img_bytes, prompt)
                             for r in results:
                                 r.raw["_photo_index"] = i
-                            all_results.extend(results)
+                                new_items.append(r.raw)
 
-                    if all_results:
-                        st.success(f"Found **{len(all_results)} item(s)** across {len(photos)} photo(s)!")
-
-                        # Store for Add All button
-                        st.session_state["scan_results"] = [r.raw for r in all_results]
-
-                        # Add All button at top
-                        if st.button("Add ALL to Collection", type="primary", key="add_all_trains"):
-                            conn = get_db()
-                            added = 0
-                            for d in st.session_state["scan_results"]:
-                                conn.execute("""INSERT INTO trains (item_name,brand,scale,era,item_type,
-                                    catalog_number,condition,has_box,estimated_value,value_notes,
-                                    is_notable,last_updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                    (d.get("item_name",""),d.get("brand",""),d.get("scale",""),
-                                     d.get("era",""),d.get("type",""),d.get("catalog_number",""),
-                                     d.get("condition",""),1 if d.get("has_original_box") else 0,
-                                     str(d.get("estimated_value","")) if d.get("estimated_value") else "",
-                                     d.get("value_notes",""),
-                                     1 if is_notable(d.get("item_name",""),d.get("brand",""),d.get("era","")) else 0,
-                                     datetime.now().isoformat()))
-                                added += 1
-                            conn.commit(); conn.close()
-                            st.success(f"Added {added} items to collection!")
-                            st.session_state.pop("scan_results", None)
-                            st.rerun()
-
-                        # Display results grouped by photo
-                        for i, img_bytes in enumerate(all_images):
-                            photo_results = [r for r in all_results if r.raw.get("_photo_index") == i]
-                            if photo_results:
-                                st.markdown(f"### Photo {i+1} - {len(photo_results)} item(s)")
-                                col1, col2 = st.columns([1, 2])
-                                with col1: st.image(img_bytes, width=280)
-                                with col2:
-                                    for r in photo_results:
-                                        d = r.raw
-                                        st.markdown(f"**{d.get('item_name','Unknown')}**")
-                                        st.markdown(f"Brand: {d.get('brand','')} | Scale: {d.get('scale','')} | Era: {d.get('era','')}")
-                                        st.markdown(f"Condition: {d.get('condition','')} | Box: {'Yes' if d.get('has_original_box') else 'No'}")
-                                        val = d.get('estimated_value')
-                                        if val: st.markdown(f"**Est. Value: ${val}**")
-                                        if d.get('value_notes'): st.caption(d['value_notes'])
-                                        if st.button(f"Add This One", key=f"add_{i}_{d.get('item_name','')[:20]}"):
-                                            conn = get_db()
-                                            conn.execute("""INSERT INTO trains (item_name,brand,scale,era,item_type,
-                                                catalog_number,condition,has_box,estimated_value,value_notes,
-                                                is_notable,last_updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                                (d.get("item_name",""),d.get("brand",""),d.get("scale",""),
-                                                 d.get("era",""),d.get("type",""),d.get("catalog_number",""),
-                                                 d.get("condition",""),1 if d.get("has_original_box") else 0,
-                                                 str(val) if val else "",d.get("value_notes",""),
-                                                 1 if is_notable(d.get("item_name",""),d.get("brand",""),d.get("era","")) else 0,
-                                                 datetime.now().isoformat()))
-                                            conn.commit(); conn.close(); st.success("Added!")
-                                        st.markdown("---")
+                    if new_items:
+                        st.session_state["scan_results"] = {
+                            "images": new_images,
+                            "items": new_items,
+                            "added": [False] * len(new_items),
+                        }
+                        st.rerun()  # render block below picks up the fresh state
                     else:
                         st.warning("Could not identify items. Try clearer photos with good lighting.")
                 except ValueError as ve:
@@ -438,6 +676,111 @@ def main():
                 except Exception as e:
                     print(f"[scan] error: {e}")
                     st.error("Photo scan failed. Try clearer photos or try again in a moment.")
+
+        # RENDER block — reads scan_results from session_state. Every rerun
+        # (including a button click inside this block) finds the state intact.
+        scan_state = st.session_state.get("scan_results")
+        if scan_state and scan_state.get("items"):
+            items = scan_state["items"]
+            images = scan_state.get("images", [])
+            added = scan_state.get("added", [False] * len(items))
+            remaining = sum(1 for a in added if not a)
+
+            st.success(
+                f"Found **{len(items)} item(s)** across {len(images)} photo(s) "
+                f"— {remaining} not yet added."
+            )
+
+            btn_col1, btn_col2 = st.columns([1, 1])
+            with btn_col1:
+                if remaining > 0 and st.button(
+                    f"Add ALL {remaining} to Collection",
+                    type="primary",
+                    key="add_all_trains",
+                ):
+                    conn = get_db()
+                    added_count = 0
+                    for idx, d in enumerate(items):
+                        if added[idx]:
+                            continue
+                        # Bundle 12: price-seed lookup — fills estimated_value from
+                        # the seed table when vision returned no value and the
+                        # (brand, catalog_number) is in the guide.
+                        seeded_val, seeded_notes = _apply_price_seed(d)
+                        cur = conn.execute(
+                            """INSERT INTO trains (item_name,brand,scale,era,item_type,
+                                catalog_number,condition,has_box,estimated_value,value_notes,
+                                is_notable,last_updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (d.get("item_name", ""), d.get("brand", ""), d.get("scale", ""),
+                             d.get("era", ""), d.get("item_type") or d.get("type", ""), d.get("catalog_number", ""),
+                             d.get("condition", ""), 1 if d.get("has_original_box") else 0,
+                             seeded_val, seeded_notes,
+                             1 if is_notable(d.get("item_name", ""), d.get("brand", ""), d.get("era", "")) else 0,
+                             datetime.now().isoformat()))
+                        # Bundle 10: persist the source photo alongside the row.
+                        # Failure of the photo save must NEVER block the add.
+                        pi = d.get("_photo_index")
+                        if isinstance(pi, int) and 0 <= pi < len(images):
+                            rel = _save_train_photo(images[pi], cur.lastrowid)
+                            if rel:
+                                conn.execute("UPDATE trains SET photo_path=? WHERE id=?", (rel, cur.lastrowid))
+                        added[idx] = True
+                        added_count += 1
+                    conn.commit(); conn.close()
+                    st.session_state["scan_results"]["added"] = added
+                    st.success(f"Added {added_count} items to collection!")
+                    st.rerun()
+            with btn_col2:
+                if st.button("Clear scan / start over", key="clear_scan"):
+                    st.session_state.pop("scan_results", None)
+                    st.rerun()
+
+            # Display results grouped by photo
+            for i, img_bytes in enumerate(images):
+                photo_idxs = [idx for idx, d in enumerate(items) if d.get("_photo_index") == i]
+                if not photo_idxs:
+                    continue
+                st.markdown(f"### Photo {i+1} — {len(photo_idxs)} item(s)")
+                col1, col2 = st.columns([1, 2])
+                with col1:
+                    st.image(img_bytes, width=280)
+                with col2:
+                    for idx in photo_idxs:
+                        d = items[idx]
+                        st.markdown(f"**{d.get('item_name','Unknown')}**")
+                        st.markdown(f"Brand: {d.get('brand','')} | Scale: {d.get('scale','')} | Era: {d.get('era','')}")
+                        st.markdown(f"Condition: {d.get('condition','')} | Box: {'Yes' if d.get('has_original_box') else 'No'}")
+                        val = d.get('estimated_value')
+                        if val:
+                            st.markdown(f"**Est. Value: ${val}**")
+                        if d.get('value_notes'):
+                            st.caption(d['value_notes'])
+                        if added[idx]:
+                            st.markdown(":white_check_mark: **Added to collection**")
+                        else:
+                            if st.button("Add This One", key=f"add_item_{idx}"):
+                                conn = get_db()
+                                seeded_val, seeded_notes = _apply_price_seed(d)
+                                cur = conn.execute(
+                                    """INSERT INTO trains (item_name,brand,scale,era,item_type,
+                                        catalog_number,condition,has_box,estimated_value,value_notes,
+                                        is_notable,last_updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                    (d.get("item_name", ""), d.get("brand", ""), d.get("scale", ""),
+                                     d.get("era", ""), d.get("item_type") or d.get("type", ""), d.get("catalog_number", ""),
+                                     d.get("condition", ""), 1 if d.get("has_original_box") else 0,
+                                     seeded_val, seeded_notes,
+                                     1 if is_notable(d.get("item_name", ""), d.get("brand", ""), d.get("era", "")) else 0,
+                                     datetime.now().isoformat()))
+                                # Bundle 10: photo save alongside row.
+                                if 0 <= i < len(images):
+                                    rel = _save_train_photo(images[i], cur.lastrowid)
+                                    if rel:
+                                        conn.execute("UPDATE trains SET photo_path=? WHERE id=?", (rel, cur.lastrowid))
+                                conn.commit(); conn.close()
+                                added[idx] = True
+                                st.session_state["scan_results"]["added"] = added
+                                st.rerun()
+                        st.markdown("---")
 
     # ── Ask AX ──
     with tab3:
@@ -544,22 +887,39 @@ def main():
             paste = st.text_area("Paste data", height=200)
             if st.button("Import", type="primary"):
                 if paste.strip():
-                    conn = get_db(); count = 0
+                    conn = get_db(); count = 0; seeded = 0
                     for line in paste.strip().split('\n'):
                         parts = line.split('\t')
                         while len(parts) < 12: parts.append("")
                         try: qty = int(parts[6].strip() or "1")
                         except: qty = 1
+                        # Bundle 12: price-seed lookup on import — fills empty
+                        # estimated_value from the seed when (brand, catalog#)
+                        # matches.
+                        row_val = parts[9].strip()
+                        row_notes = parts[11].strip()
+                        if not row_val:
+                            sv, sn = _apply_price_seed({
+                                "brand": parts[1].strip(),
+                                "catalog_number": parts[5].strip(),
+                                "value_notes": row_notes,
+                            })
+                            if sv:
+                                row_val = sv; row_notes = sn; seeded += 1
                         conn.execute("""INSERT INTO trains (item_name,brand,scale,era,item_type,
                             catalog_number,quantity,condition,has_box,estimated_value,location,notes,is_notable)
                             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                             (parts[0].strip(),parts[1].strip(),parts[2].strip(),parts[3].strip(),
                              parts[4].strip(),parts[5].strip(),qty,parts[7].strip(),
                              1 if parts[8].strip().lower() in ("yes","1","true","y") else 0,
-                             parts[9].strip(),parts[10].strip(),parts[11].strip(),
+                             row_val,parts[10].strip(),row_notes,
                              1 if is_notable(parts[0].strip(),parts[1].strip(),parts[3].strip()) else 0))
                         count += 1
-                    conn.commit(); conn.close(); st.success(f"Imported {count} items"); st.rerun()
+                    conn.commit(); conn.close()
+                    msg = f"Imported {count} items"
+                    if seeded:
+                        msg += f" — {seeded} auto-priced from the price seed"
+                    st.success(msg); st.rerun()
 
             uploaded = st.file_uploader("Or upload CSV/TSV", type=["csv","tsv","txt"])
             if uploaded:
@@ -620,6 +980,95 @@ def main():
 
                     st.download_button("Download Report", report, "train_collection_report.md", "text/markdown")
                     st.markdown(report)
+
+                # Bundle 11: printable label sheet — physical-to-digital bridge.
+                # Avery 5160 layout (1" × 2-5/8", 3 cols × 10 rows = 30 per page).
+                # Self-contained HTML with embedded SVG QR codes — opens in any
+                # browser, hit Print, no PDF library required.
+                st.markdown("---")
+                st.markdown("### Label Sheet (print on Avery 5160 — 30 per page)")
+                st.caption(
+                    "Generates a printable sheet of physical labels. Each label has the item ID "
+                    "(`T-NNNN`), brand + name, and a QR code that opens the app focused on that item. "
+                    "Stick the labels on your shelves so you can scan any train back into the app."
+                )
+                if st.button("Generate Label Sheet"):
+                    conn = get_db()
+                    label_df = pd.read_sql_query(
+                        "SELECT id, item_name, brand, catalog_number FROM trains "
+                        "ORDER BY brand, item_name", conn)
+                    conn.close()
+                    base_url = "https://train.path-os.net"
+                    # Avery 5160 stylesheet — 1" tall, 2.625" wide, 30 per page.
+                    css = """
+                    <style>
+                      @page { size: letter; margin: 0.5in 0.1875in 0.5in 0.1875in; }
+                      body { font-family: -apple-system, Helvetica, Arial, sans-serif; margin: 0; }
+                      .sheet { display: grid; grid-template-columns: repeat(3, 2.625in);
+                               grid-auto-rows: 1in; gap: 0 0.125in; }
+                      .label { display: flex; align-items: center; padding: 0.05in 0.1in;
+                               box-sizing: border-box; overflow: hidden; }
+                      .qr { width: 0.85in; height: 0.85in; flex: 0 0 auto; margin-right: 0.1in; }
+                      .qr svg { width: 100%; height: 100%; display: block; }
+                      .meta { display: flex; flex-direction: column; justify-content: center;
+                              line-height: 1.2; overflow: hidden; }
+                      .code { font-family: monospace; font-size: 11pt; font-weight: 700; }
+                      .name { font-size: 9pt; font-weight: 600;
+                              white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+                      .sub  { font-size: 8pt; color: #555;
+                              white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+                      .toolbar { padding: 12px; background: #f4f4f4; text-align: center;
+                                 font-family: sans-serif; }
+                      @media print { .toolbar { display: none; } }
+                    </style>
+                    """
+                    labels_html = []
+                    for _, r in label_df.iterrows():
+                        tid = int(r["id"])
+                        code = _label_code(tid)
+                        try:
+                            qr_svg = _qr_svg_for(tid, base_url, user_name)
+                        except Exception as e:
+                            print(f"[label qr] failed for {tid}: {e}")
+                            qr_svg = ""
+                        # Codex 2026-05-16: HTML-escape every interpolated DB
+                        # field. Without this, a train named `<script>alert(1)
+                        # </script>` would execute when the label sheet opens.
+                        name = (r.get("item_name") or "").strip() or "Unknown"
+                        brand = (r.get("brand") or "").strip()
+                        catn = (r.get("catalog_number") or "").strip()
+                        sub_bits = [b for b in [brand, catn] if b]
+                        sub = " · ".join(sub_bits)
+                        labels_html.append(
+                            '<div class="label">'
+                            f'<div class="qr">{qr_svg}</div>'
+                            '<div class="meta">'
+                            f'<div class="code">{_html.escape(code)}</div>'
+                            f'<div class="name">{_html.escape(name)}</div>'
+                            f'<div class="sub">{_html.escape(sub)}</div>'
+                            '</div></div>'
+                        )
+                    html = (
+                        "<!doctype html><html><head><meta charset=\"utf-8\">"
+                        f"<title>Train Collection Labels ({len(label_df)})</title>"
+                        f"{css}</head><body>"
+                        '<div class="toolbar">'
+                        f"{len(label_df)} labels — click Print or press Ctrl/Cmd-P. "
+                        "Load Avery 5160 sheets into your printer first."
+                        ' <button onclick="window.print()">Print</button>'
+                        "</div>"
+                        f'<div class="sheet">{"".join(labels_html)}</div>'
+                        "</body></html>"
+                    )
+                    st.download_button(
+                        "Download Label Sheet (HTML)",
+                        html,
+                        "train_labels.html",
+                        "text/html",
+                    )
+                    st.success(
+                        f"Generated {len(label_df)} labels. Download → open in any browser → Print."
+                    )
 
                 # Auction house packet
                 st.markdown("---")
