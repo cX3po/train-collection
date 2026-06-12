@@ -27,6 +27,10 @@ Usage:
 import base64
 import json
 import os
+import re
+import shutil
+import subprocess
+import tempfile
 from dataclasses import dataclass, field
 
 import requests
@@ -85,6 +89,57 @@ def validate_image(image_bytes: bytes | None) -> bytes:
 
 # ── Providers ────────────────────────────────────────────────────────────────
 
+def _find_claude_cli() -> str:
+    """Locate the Claude (Max-subscription) CLI binary, or '' if absent."""
+    cli = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+    return cli if cli and os.path.exists(cli) else ""
+
+
+def _call_subscription(image_bytes: bytes, prompt: str, api_key: str, timeout: int) -> str:
+    """Vision via the operator's Max subscription (the `claude` CLI) — NO API key.
+
+    Writes the photo to a temp file and asks `claude -p` to read it, the SAME
+    subscription path the app already uses for chat. This is the canonical vision
+    route for a subscription-only account where raw API keys aren't in use:
+    routing through the subscription means no key can break a scan (corruption,
+    rotation, or deactivation are all moot). `api_key` is ignored here (kept only
+    for call-signature parity with the other providers)."""
+    cli = _find_claude_cli()
+    if not cli:
+        raise RuntimeError("Claude subscription CLI not found — install it or set GEMINI_API_KEY.")
+    ext = {"image/png": ".png", "image/webp": ".webp", "image/gif": ".gif"}.get(
+        detect_mime(image_bytes), ".jpg")
+    tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+    try:
+        tmp.write(image_bytes)
+        tmp.close()
+        # `claude -p` reads local image files referenced by path. Cold-start + vision
+        # is slower than a raw API call, so floor the timeout generously (a one-off
+        # scan that takes ~60-90s beats a scan that 401s instantly).
+        eff_timeout = max(timeout, 120)
+        full_prompt = f"Read the image file at {tmp.name}. {prompt}"
+        try:
+            proc = subprocess.run(
+                [cli, "-p", full_prompt],
+                capture_output=True, text=True, timeout=eff_timeout,
+                stdin=subprocess.DEVNULL,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"Subscription vision timed out after {eff_timeout}s.")
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip()[:300]
+            raise RuntimeError(f"Subscription vision failed (rc={proc.returncode}): {err}")
+        out = (proc.stdout or "").strip()
+        if not out:
+            raise RuntimeError("Subscription vision returned no output.")
+        return out
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
 def _call_haiku(image_bytes: bytes, prompt: str, api_key: str, timeout: int) -> str:
     """Call Claude Haiku Vision API. Returns raw text response."""
     b64 = base64.b64encode(image_bytes).decode("utf-8")
@@ -119,8 +174,17 @@ def _call_haiku(image_bytes: bytes, prompt: str, api_key: str, timeout: int) -> 
     )
 
     if not resp.ok:
-        print(f"[engine.haiku] HTTP {resp.status_code}: {resp.text[:500]}")
-        raise RuntimeError("Vision service unavailable. Try again in a moment.")
+        error_detail = resp.text[:500] if resp.text else f"HTTP {resp.status_code}"
+        print(f"[engine.haiku] HTTP {resp.status_code}: {error_detail}")
+        if resp.status_code == 400:
+            # HTTP 400 usually means invalid API key or malformed request
+            if "api_key" in error_detail.lower() or "invalid" in error_detail.lower():
+                error_msg = "Invalid API key. Check ANTHROPIC_API_KEY in ~/axiom/.env"
+            else:
+                error_msg = f"API request error: {error_detail[:150]}"
+        else:
+            error_msg = error_detail[:200] if error_detail else f"HTTP {resp.status_code}"
+        raise RuntimeError(f"Anthropic API error ({resp.status_code}): {error_msg}")
 
     data = resp.json()
     return data["content"][0]["text"]
@@ -153,6 +217,10 @@ def _call_gemini(image_bytes: bytes, prompt: str, api_key: str, timeout: int) ->
 
 
 _PROVIDERS = {
+    "subscription": {
+        "call": _call_subscription,
+        "env_key": None,          # keyless — runs on the Max subscription CLI
+    },
     "haiku": {
         "call": _call_haiku,
         "env_key": "ANTHROPIC_API_KEY",
@@ -167,16 +235,41 @@ _PROVIDERS = {
 # ── JSON extraction ──────────────────────────────────────────────────────────
 
 def _extract_json(text: str) -> list[dict] | dict:
-    """Extract JSON from LLM response, stripping markdown fences if present."""
+    """Extract JSON from an LLM response. Handles three shapes, in order:
+      1. a ```json fenced block anywhere in the text,
+      2. the whole text as bare JSON,
+      3. the first balanced [...] / {...} span embedded in prose.
+    (3) matters for the subscription CLI, which is more conversational than the
+    raw API and often writes a sentence of preamble before the JSON block."""
     text = text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1] if "\n" in text else text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
 
-    result = json.loads(text)
-    return result
+    # 1) Fenced code block anywhere (```json ... ``` or ``` ... ```).
+    fence = re.search(r"```(?:json)?\s*(.+?)```", text, re.S)
+    if fence:
+        try:
+            return json.loads(fence.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+
+    # 2) Whole text as-is.
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 3) Widest array/object span (tolerates leading/trailing prose; each
+    #    candidate is json.loads-validated, so an over-wide span just falls through).
+    for open_ch, close_ch in (("[", "]"), ("{", "}")):
+        start, end = text.find(open_ch), text.rfind(close_ch)
+        if start != -1 and end > start:
+            try:
+                return json.loads(text[start:end + 1])
+            except json.JSONDecodeError:
+                continue
+
+    print("[engine.json_parse] Failed to parse JSON from vision response")
+    print(f"[engine.json_parse] Response text (first 500 chars): {text[:500]}")
+    raise RuntimeError(f"Vision API returned invalid JSON. Response: {text[:100]}...")
 
 
 # ── Engine ───────────────────────────────────────────────────────────────────
@@ -201,26 +294,33 @@ class VisionEngine:
     ):
         self.timeout = timeout
 
-        # Auto-detect provider
+        # Auto-detect provider. Prefer the subscription CLI when present (a
+        # subscription-only account has no working raw API key). Fall back to a
+        # raw key only if the CLI is absent (e.g. a BYOK deployment).
         if provider:
             self.provider = provider
+        elif _find_claude_cli():
+            self.provider = "subscription"
         elif os.getenv("ANTHROPIC_API_KEY"):
             self.provider = "haiku"
         elif os.getenv("GEMINI_API_KEY"):
             self.provider = "gemini"
         else:
             raise RuntimeError(
-                "No vision provider found. Set ANTHROPIC_API_KEY or GEMINI_API_KEY."
+                "No vision provider found. Install the Claude CLI (subscription) "
+                "or set ANTHROPIC_API_KEY / GEMINI_API_KEY."
             )
 
         if self.provider not in _PROVIDERS:
             raise ValueError(f"Unknown provider: {self.provider}. Use: {list(_PROVIDERS.keys())}")
 
-        # API key: explicit > env var
+        # API key: explicit > env var. The subscription provider needs NO key.
         prov = _PROVIDERS[self.provider]
-        self.api_key = api_key or os.getenv(prov["env_key"], "")
-        if not self.api_key:
-            raise RuntimeError(f"{prov['env_key']} not set for provider {self.provider}.")
+        self.api_key = ""
+        if prov["env_key"]:
+            self.api_key = api_key or os.getenv(prov["env_key"], "")
+            if not self.api_key:
+                raise RuntimeError(f"{prov['env_key']} not set for provider {self.provider}.")
 
         self._call = prov["call"]
 

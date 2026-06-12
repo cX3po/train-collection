@@ -35,11 +35,13 @@ def _claude_cli_supports(flag: str) -> bool:
     except Exception:
         return False
 
-# Load API key (used for vision; chat uses CLI under the operator's Max subscription)
+# Legacy raw-API-key loader. NOTE: photo-scan no longer uses this — vision runs on
+# the Max subscription (the claude CLI) via engine.py, which needs no key. This is
+# kept only for the optional raw-HTTP chat fallback and stays best-effort.
 def load_api_key():
     try:
         key = st.secrets.get("ANTHROPIC_API_KEY", "")
-        if key: return key
+        if key and key.strip(): return key.strip()
     except (FileNotFoundError, KeyError, AttributeError):
         pass
     env_path = os.path.expanduser("~/axiom/.env")
@@ -47,8 +49,14 @@ def load_api_key():
         with open(env_path) as f:
             for line in f:
                 if line.startswith("ANTHROPIC_API_KEY="):
-                    return line.strip().split("=", 1)[1].strip('"').strip("'")
-    return os.getenv("ANTHROPIC_API_KEY", "")
+                    # Extract value and strip all quotes + whitespace
+                    val = line.split("=", 1)[1].strip()
+                    val = val.strip('"').strip("'").strip()
+                    if val:
+                        return val
+    # Finally try environment variable
+    env_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    return env_key
 
 API_KEY = load_api_key()
 if API_KEY: os.environ["ANTHROPIC_API_KEY"] = API_KEY
@@ -590,7 +598,8 @@ def main():
                         if fcond:
                             st.caption(f"Condition: {fcond}")
                         if fval:
-                            st.caption(f"Est. value: ${fval}")
+                            clean_fval = str(fval).lstrip("$").strip()
+                            st.caption(f"Est. value: ${clean_fval}")
                     if st.button("Clear focus", key="clear_focus"):
                         # Drop the focus param so a refresh doesn't reopen the
                         # banner. Preserves user= so the sign-in stays warm.
@@ -633,6 +642,65 @@ def main():
 
     # ── Collection ──
     with tab1:
+        # Quick Add form — typed entry, no photo / no TSV / no Excel round-trip.
+        # Colin (2026-05-18) lost 4 entries by editing the export CSV in Excel
+        # and never re-uploading — the previous add paths (Scan Items, paste-
+        # import, Import/Export upload) all had friction that didn't match a
+        # casual "I just want to type the train name and hit add" mental model.
+        with st.expander("➕ Quick add a train (type it in — no photo needed)", expanded=False):
+            with st.form("quick_add_train", clear_on_submit=True):
+                qa_c1, qa_c2, qa_c3 = st.columns([2, 2, 1])
+                with qa_c1:
+                    qa_name = st.text_input("Train name *", placeholder="e.g. Cattle Car")
+                    qa_brand = st.text_input("Brand", placeholder="e.g. Bachmann, Lionel, MTH")
+                with qa_c2:
+                    qa_scale = st.selectbox(
+                        "Scale", ["", "#1", "G-Scale", "O", "S", "HO", "N", "Standard Gauge", "Other"]
+                    )
+                    qa_type = st.text_input("Type", placeholder="e.g. Caboose, Freight Car")
+                with qa_c3:
+                    qa_catalog = st.text_input("Catalog #", placeholder="optional")
+                    qa_cond = st.selectbox(
+                        "Condition", ["Good", "Mint", "Like New", "Excellent", "Fair", "Poor"]
+                    )
+                qa_notes = st.text_area("Notes", placeholder="optional — road name, history, anything to remember", height=68)
+                qa_submitted = st.form_submit_button("Add to collection", type="primary")
+                if qa_submitted:
+                    if not qa_name.strip():
+                        st.error("Train name is required.")
+                    else:
+                        try:
+                            qa_conn = get_db()
+                            qa_conn.execute(
+                                """INSERT INTO trains
+                                    (item_name, brand, scale, era, item_type, catalog_number,
+                                     quantity, condition, has_box, estimated_value, location,
+                                     notes, is_notable, last_updated)
+                                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                (
+                                    qa_name.strip(),
+                                    qa_brand.strip(),
+                                    qa_scale.strip(),
+                                    "",
+                                    qa_type.strip(),
+                                    qa_catalog.strip(),
+                                    1,
+                                    qa_cond.strip(),
+                                    0,
+                                    "",
+                                    "",
+                                    qa_notes.strip(),
+                                    1 if is_notable(qa_name.strip(), qa_brand.strip(), "") else 0,
+                                    datetime.now().isoformat(),
+                                ),
+                            )
+                            qa_conn.commit(); qa_conn.close()
+                            st.success(f"Added '{qa_name.strip()}' to your collection.")
+                            st.rerun()
+                        except Exception as qa_e:
+                            print(f"[quick_add] insert failed: {qa_e}")
+                            st.error("Could not add — please try again. If this keeps happening, tell Phil.")
+
         conn = get_db()
         q = "SELECT * FROM trains WHERE 1=1"
         p = []
@@ -658,26 +726,74 @@ def main():
 
             if view_mode.startswith("Gallery"):
                 # Bundle 10 Gallery view — card grid showing the saved photo + key
-                # metadata for each item. Read-only by design (editing happens in
-                # Table view) so it stays fast even at 1000+ items.
+                # metadata for each item. Includes delete photo button for each card.
                 cards_per_row = 3
                 rows = df.to_dict("records")
                 for i in range(0, len(rows), cards_per_row):
                     cols = st.columns(cards_per_row)
                     for j, row in enumerate(rows[i:i+cards_per_row]):
                         with cols[j]:
-                            photo_abs = _safe_photo_path(row.get("photo_path") or "")
-                            if photo_abs:
-                                st.image(photo_abs, use_container_width=True)
-                            else:
-                                st.caption(":camera_with_flash: _no photo_")
-                            name = (row.get("item_name") or "Unknown").strip()
-                            brand = (row.get("brand") or "").strip()
-                            val = (row.get("estimated_value") or "").strip()
-                            tid = int(row['id'])
-                            st.markdown(f"**{name}**  \n{brand} · `{_label_code(tid)}`")
-                            if val:
-                                st.caption(f"Est. value: ${val}")
+                            try:
+                                photo_abs = _safe_photo_path(row.get("photo_path") or "")
+                                if photo_abs:
+                                    st.image(photo_abs, use_container_width=True)
+                                else:
+                                    st.caption(":camera_with_flash: _no photo_")
+                                name = (row.get("item_name") or "Unknown").strip()
+                                brand = (row.get("brand") or "").strip()
+                                val = (row.get("estimated_value") or "").strip()
+                                tid = row.get('id')
+                                if tid is not None:
+                                    tid = int(tid)
+                                    st.markdown(f"**{name}**  \n{brand} · `{_label_code(tid)}`")
+                                else:
+                                    st.markdown(f"**{name}**  \n{brand}")
+                                if val:
+                                    clean_val = val.lstrip("$").strip()
+                                    st.caption(f"Est. value: ${clean_val}")
+
+                                # Delete photo button (only show if photo exists)
+                                if photo_abs:
+                                    if st.button("🗑️ Delete Photo", key=f"gallery_delete_{tid}", use_container_width=True, type="secondary"):
+                                        st.session_state[f"confirm_gallery_delete_{tid}"] = True
+
+                                # Confirmation dialog
+                                if st.session_state.get(f"confirm_gallery_delete_{tid}"):
+                                    st.warning(f"Delete photo for **{name}**? Item will remain.")
+                                    gd1, gd2 = st.columns(2)
+                                    with gd1:
+                                        if st.button("Yes, delete", key=f"confirm_gd_yes_{tid}", type="primary"):
+                                            try:
+                                                conn = get_db()
+                                                row_data = conn.execute("SELECT photo_path FROM trains WHERE id=?", (tid,)).fetchone()
+                                                photo_path = row_data[0] if row_data else None
+
+                                                # Clear database
+                                                conn.execute("UPDATE trains SET photo_path=NULL, last_updated=? WHERE id=?",
+                                                           (datetime.now().isoformat(), tid))
+                                                conn.commit(); conn.close()
+
+                                                # Delete file
+                                                if photo_path:
+                                                    photo_abs_delete = _safe_photo_path(photo_path)
+                                                    if photo_abs_delete:
+                                                        try:
+                                                            os.remove(photo_abs_delete)
+                                                        except Exception as e:
+                                                            print(f"[gallery_delete] failed to remove {photo_abs_delete}: {e}")
+
+                                                st.session_state.pop(f"confirm_gallery_delete_{tid}", None)
+                                                st.success("Photo deleted!")
+                                                st.rerun()
+                                            except Exception as e:
+                                                print(f"[gallery_delete] failed: {e}")
+                                                st.error(f"Delete failed: {e}")
+                                    with gd2:
+                                        if st.button("Cancel", key=f"cancel_gd_{tid}"):
+                                            st.session_state.pop(f"confirm_gallery_delete_{tid}", None)
+                                            st.rerun()
+                            except Exception as e:
+                                print(f"[gallery] render error: {e}")
 
             else:
                 edit_cols = ["id","item_name","brand","scale","era","item_type","catalog_number",
@@ -695,16 +811,200 @@ def main():
                     conn = get_db()
                     for _, row in edited.iterrows():
                         if pd.notna(row.get("id")):
+                            # Convert NaN → "" to prevent clearing NULL fields during update
+                            def safe_val(v, default=""):
+                                return default if pd.isna(v) else v
                             conn.execute("""UPDATE trains SET item_name=?,brand=?,scale=?,era=?,item_type=?,
                                 catalog_number=?,quantity=?,condition=?,has_box=?,estimated_value=?,
                                 location=?,notes=?,last_updated=? WHERE id=?""",
-                                (row.get("item_name",""),row.get("brand",""),row.get("scale",""),
-                                 row.get("era",""),row.get("item_type",""),row.get("catalog_number",""),
-                                 row.get("quantity",1),row.get("condition",""),
+                                (safe_val(row.get("item_name")),safe_val(row.get("brand")),safe_val(row.get("scale")),
+                                 safe_val(row.get("era")),safe_val(row.get("item_type")),safe_val(row.get("catalog_number")),
+                                 int(safe_val(row.get("quantity"),1)),safe_val(row.get("condition")),
                                  1 if row.get("has_box") else 0,
-                                 row.get("estimated_value",""),row.get("location",""),
-                                 row.get("notes",""),datetime.now().isoformat(),row["id"]))
+                                 safe_val(row.get("estimated_value")),safe_val(row.get("location")),
+                                 safe_val(row.get("notes")),datetime.now().isoformat(),int(row["id"])))
                     conn.commit(); conn.close(); st.success("Saved!")
+
+                # Delete individual items
+                st.markdown("---")
+                st.markdown("### 🗑️ Delete Item")
+                delete_col1, delete_col2 = st.columns([2, 1])
+                with delete_col1:
+                    delete_items_list = [(int(r["id"]), _label_code(int(r["id"])) + ": " + (r.get("item_name") or "Unknown").strip()) for _, r in df.iterrows()]
+                    selected_delete_idx = st.selectbox(
+                        "Choose item to delete",
+                        range(len(delete_items_list)),
+                        format_func=lambda i: delete_items_list[i][1],
+                        label_visibility="collapsed",
+                        key="delete_item_select"
+                    )
+                    selected_delete_id = delete_items_list[selected_delete_idx][0]
+                with delete_col2:
+                    if st.button("Delete", type="secondary", key="delete_item_btn"):
+                        st.session_state["confirm_delete_id"] = selected_delete_id
+                        st.session_state["confirm_delete_name"] = delete_items_list[selected_delete_idx][1]
+
+                if "confirm_delete_id" in st.session_state:
+                    st.warning(f"⚠️ Delete **{st.session_state['confirm_delete_name']}**?")
+                    dc1, dc2 = st.columns(2)
+                    with dc1:
+                        if st.button("Yes, delete", type="primary", key="confirm_delete"):
+                            try:
+                                conn = get_db()
+                                # Get the photo_path before deleting so we can clean up the file
+                                row = conn.execute("SELECT photo_path FROM trains WHERE id=?",
+                                                  (st.session_state["confirm_delete_id"],)).fetchone()
+                                photo_path = row[0] if row else None
+
+                                # Delete the row
+                                conn.execute("DELETE FROM trains WHERE id=?",
+                                            (st.session_state["confirm_delete_id"],))
+                                conn.commit(); conn.close()
+
+                                # Clean up photo file if it exists
+                                if photo_path:
+                                    photo_abs = _safe_photo_path(photo_path)
+                                    if photo_abs:
+                                        try:
+                                            os.remove(photo_abs)
+                                        except Exception as e:
+                                            print(f"[delete_photo] failed to remove {photo_abs}: {e}")
+
+                                st.session_state.pop("confirm_delete_id", None)
+                                st.session_state.pop("confirm_delete_name", None)
+                                st.success(f"Deleted! Reload to see updated list.")
+                                st.rerun()
+                            except Exception as e:
+                                print(f"[delete_item] failed: {e}")
+                                st.error(f"Delete failed: {e}")
+                    with dc2:
+                        if st.button("Cancel", key="cancel_delete"):
+                            st.session_state.pop("confirm_delete_id", None)
+                            st.session_state.pop("confirm_delete_name", None)
+                            st.rerun()
+
+                # Upload Photo for existing item
+                st.markdown("---")
+                st.markdown("### 📸 Upload Photo for an Item")
+                if not df.empty:
+                    # Create display strings: "T-NNNN: Item Name (Brand)"
+                    items_list = []
+                    for _, row in df.iterrows():
+                        tid = int(row["id"])
+                        code = _label_code(tid)
+                        name = (row.get("item_name") or "Unknown").strip()
+                        brand = (row.get("brand") or "").strip()
+                        display = f"{code}: {name}"
+                        if brand:
+                            display += f" ({brand})"
+                        items_list.append((tid, display))
+
+                    upc1, upc2 = st.columns([2, 1])
+                    with upc1:
+                        selected_idx = st.selectbox(
+                            "Choose item to photograph",
+                            range(len(items_list)),
+                            format_func=lambda i: items_list[i][1],
+                            label_visibility="collapsed"
+                        )
+                        selected_id = items_list[selected_idx][0]
+                    with upc2:
+                        photo_file = st.file_uploader(
+                            "Photo",
+                            type=["jpg","jpeg","png","webp"],
+                            label_visibility="collapsed",
+                            key="upload_photo_for_item"
+                        )
+
+                    if photo_file and st.button("Save Photo", type="primary", key="save_item_photo"):
+                        try:
+                            img_bytes = photo_file.read()
+                            rel_path = _save_train_photo(img_bytes, selected_id)
+                            if rel_path:
+                                conn = get_db()
+                                conn.execute("UPDATE trains SET photo_path=?, last_updated=? WHERE id=?",
+                                           (rel_path, datetime.now().isoformat(), selected_id))
+                                conn.commit(); conn.close()
+                                st.success(f"Photo saved! Reload the app to see it in the Gallery.")
+                                st.rerun()
+                            else:
+                                st.error("Could not save photo. Try a different image file.")
+                        except Exception as e:
+                            print(f"[photo_upload] failed: {e}")
+                            st.error(f"Photo upload failed: {e}")
+
+                # Delete Photo from existing item
+                st.markdown("---")
+                st.markdown("### 🗑️ Delete Photo (Keep Item)")
+
+                # Build list of items that have photos
+                items_with_photos = []
+                for _, row in df.iterrows():
+                    if row.get("photo_path"):
+                        tid = int(row["id"])
+                        code = _label_code(tid)
+                        name = (row.get("item_name") or "Unknown").strip()
+                        brand = (row.get("brand") or "").strip()
+                        display = f"{code}: {name}"
+                        if brand:
+                            display += f" ({brand})"
+                        items_with_photos.append((tid, display))
+
+                if items_with_photos:
+                    dp1, dp2 = st.columns([2, 1])
+                    with dp1:
+                        delete_photo_idx = st.selectbox(
+                            "Choose item whose photo to delete",
+                            range(len(items_with_photos)),
+                            format_func=lambda i: items_with_photos[i][1],
+                            label_visibility="collapsed",
+                            key="delete_photo_select"
+                        )
+                        delete_photo_id = items_with_photos[delete_photo_idx][0]
+                    with dp2:
+                        if st.button("Delete Photo", type="secondary", key="delete_photo_btn"):
+                            st.session_state["confirm_delete_photo_id"] = delete_photo_id
+                            st.session_state["confirm_delete_photo_name"] = items_with_photos[delete_photo_idx][1]
+
+                    if "confirm_delete_photo_id" in st.session_state:
+                        st.warning(f"⚠️ Delete photo for **{st.session_state['confirm_delete_photo_name']}**? (Item will remain)")
+                        dpd1, dpd2 = st.columns(2)
+                        with dpd1:
+                            if st.button("Yes, delete photo", type="primary", key="confirm_delete_photo"):
+                                try:
+                                    conn = get_db()
+                                    row = conn.execute("SELECT photo_path FROM trains WHERE id=?",
+                                                      (st.session_state["confirm_delete_photo_id"],)).fetchone()
+                                    photo_path = row[0] if row else None
+
+                                    # Clear the photo_path in database
+                                    conn.execute("UPDATE trains SET photo_path=NULL, last_updated=? WHERE id=?",
+                                               (datetime.now().isoformat(), st.session_state["confirm_delete_photo_id"]))
+                                    conn.commit(); conn.close()
+
+                                    # Delete the photo file
+                                    if photo_path:
+                                        photo_abs = _safe_photo_path(photo_path)
+                                        if photo_abs:
+                                            try:
+                                                os.remove(photo_abs)
+                                            except Exception as e:
+                                                print(f"[delete_photo_file] failed to remove {photo_abs}: {e}")
+
+                                    st.session_state.pop("confirm_delete_photo_id", None)
+                                    st.session_state.pop("confirm_delete_photo_name", None)
+                                    st.success("Photo deleted! Item remains in your collection.")
+                                    st.rerun()
+                                except Exception as e:
+                                    print(f"[delete_photo] failed: {e}")
+                                    st.error(f"Delete failed: {e}")
+                        with dpd2:
+                            if st.button("Cancel", key="cancel_delete_photo"):
+                                st.session_state.pop("confirm_delete_photo_id", None)
+                                st.session_state.pop("confirm_delete_photo_name", None)
+                                st.rerun()
+                else:
+                    st.caption("No items with photos yet.")
 
     # ── Scan Items ──
     with tab2:
@@ -746,13 +1046,16 @@ def main():
         # "Add This One" / "Add ALL" no longer make the results vanish — that
         # was the "can only save 3 pictures" symptom Dad reported.
         if photos and st.button("Scan All Photos", type="primary"):
-            if not API_KEY:
-                st.error("No API key configured.")
+            # Vision runs on the Max subscription (the claude CLI), not a raw API
+            # key — so the gate is CLI availability, not API_KEY. The subscription
+            # path can't be broken by key corruption/rotation/deactivation.
+            if not os.path.exists(CLAUDE_BIN):
+                st.error("❌ Claude subscription CLI not found. Vision scanning is unavailable.")
             else:
                 try:
                     from engine import VisionEngine
                     from train_prompts import TRAIN_IDENTIFIER, TRAIN_ROOM_SCAN
-                    engine = VisionEngine(provider="haiku")
+                    engine = VisionEngine(provider="subscription")
 
                     new_items = []
                     new_images = []
@@ -780,8 +1083,14 @@ def main():
                     print(f"[scan] validation error: {ve}")
                     st.error(f"Image issue: {ve}")
                 except Exception as e:
-                    print(f"[scan] error: {e}")
-                    st.error("Photo scan failed. Try clearer photos or try again in a moment.")
+                    import traceback
+                    error_detail = traceback.format_exc()
+                    print(f"[scan] error: {e}\n{error_detail}")
+                    st.error(f"Photo scan failed: {str(e)}")
+                    if "subscription" in str(e).lower() or "cli" in str(e).lower():
+                        st.info("💡 The Claude subscription isn't available right now. It usually clears on its own — try again in a minute.")
+                    elif "json" in str(e).lower() or "parse" in str(e).lower():
+                        st.info("💡 The vision API returned an unexpected response. This sometimes happens during high load. Try again in a moment.")
 
         # RENDER block — reads scan_results from session_state. Every rerun
         # (including a button click inside this block) finds the state intact.
@@ -880,7 +1189,8 @@ def main():
                         st.markdown(f"Condition: {d.get('condition','')} | Box: {'Yes' if d.get('has_original_box') else 'No'}")
                         val = d.get('estimated_value')
                         if val:
-                            st.markdown(f"**Est. Value: ${val}**")
+                            clean_val = str(val).lstrip("$").strip()
+                            st.markdown(f"**Est. Value: ${clean_val}**")
                         if d.get('value_notes'):
                             st.caption(d['value_notes'])
                         if added[idx]:
@@ -916,22 +1226,36 @@ def main():
         st.caption("Your family AI assistant - ask about train identification, values, selling, anything.")
 
         if "train_chat" not in st.session_state: st.session_state.train_chat = []
-        for msg in st.session_state.train_chat:
-            with st.chat_message(msg["role"], avatar="\U0001f916" if msg["role"]=="assistant" else "\U0001f9d1"):
-                st.markdown(msg["content"])
 
-        if prompt := st.chat_input("Ask AX about trains..."):
+        # Show conversation history with clear message count
+        if st.session_state.train_chat:
+            st.info(f"📝 Conversation: {len(st.session_state.train_chat)} message(s)")
+            for msg in st.session_state.train_chat:
+                with st.chat_message(msg["role"], avatar="\U0001f916" if msg["role"]=="assistant" else "\U0001f9d1"):
+                    st.markdown(msg["content"])
+        else:
+            st.info("💬 Start a conversation by asking AX about your trains")
+
+        # Input section stays clearly visible
+        st.markdown("---")
+        col_input, col_clear = st.columns([4, 1])
+        with col_input:
+            prompt = st.chat_input("Ask AX about trains...")
+        with col_clear:
+            if st.button("Clear Chat", key="clear_chat_btn"):
+                st.session_state.train_chat = []
+                st.rerun()
+
+        if prompt:
             st.session_state.train_chat.append({"role":"user","content":prompt})
-            with st.chat_message("user", avatar="\U0001f9d1"): st.markdown(prompt)
+            with st.chat_message("user", avatar="\U0001f9d1"):
+                st.markdown(prompt)
             with st.chat_message("assistant", avatar="\U0001f916"):
                 with st.spinner("AX is thinking..."):
                     ctx = f"You're talking to {user_name}. Collection has {total} items. Brands: {', '.join(brands[:5])}." if brands else f"You're talking to {user_name}."
                     resp = chat_with_ax(prompt, ctx, st.session_state.train_chat)
                     st.markdown(resp)
                     st.session_state.train_chat.append({"role":"assistant","content":resp})
-
-        if st.session_state.train_chat and st.button("Clear Chat"):
-            st.session_state.train_chat = []; st.rerun()
 
     # ── Sell Items ──
     with tab4:
@@ -1016,32 +1340,48 @@ def main():
             if st.button("Import", type="primary"):
                 if paste.strip():
                     conn = get_db(); count = 0; seeded = 0
-                    for line in paste.strip().split('\n'):
+                    for line_idx, line in enumerate(paste.strip().split('\n')):
+                        if not line.strip():
+                            continue
                         parts = line.split('\t')
+                        # Same smart column mapping as file upload
+                        col_indices = {
+                            "item_name": 0, "brand": 1, "scale": 2, "era": 3,
+                            "item_type": 4, "catalog_number": 5, "quantity": 6,
+                            "condition": 7, "has_box": 8, "estimated_value": 9,
+                            "location": 10, "notes": 11
+                        }
                         while len(parts) < 12: parts.append("")
-                        try: qty = int(parts[6].strip() or "1")
+                        def safe_get(idx, default=""):
+                            return parts[idx].strip() if idx < len(parts) else default
+                        try: qty = int(safe_get(col_indices.get("quantity", 6)) or "1")
                         except: qty = 1
-                        # Bundle 12: price-seed lookup on import — fills empty
-                        # estimated_value from the seed when (brand, catalog#)
-                        # matches.
-                        row_val = parts[9].strip()
-                        row_notes = parts[11].strip()
+                        row_val = safe_get(col_indices.get("estimated_value", 9))
+                        row_notes = safe_get(col_indices.get("notes", 11))
                         if not row_val:
                             sv, sn = _apply_price_seed({
-                                "brand": parts[1].strip(),
-                                "catalog_number": parts[5].strip(),
+                                "brand": safe_get(col_indices.get("brand", 1)),
+                                "catalog_number": safe_get(col_indices.get("catalog_number", 5)),
                                 "value_notes": row_notes,
                             })
                             if sv:
                                 row_val = sv; row_notes = sn; seeded += 1
+                        item_name = safe_get(col_indices.get("item_name", 0))
+                        brand = safe_get(col_indices.get("brand", 1))
+                        scale = safe_get(col_indices.get("scale", 2))
+                        era = safe_get(col_indices.get("era", 3))
+                        item_type = safe_get(col_indices.get("item_type", 4))
+                        catalog_number = safe_get(col_indices.get("catalog_number", 5))
+                        condition = safe_get(col_indices.get("condition", 7))
+                        has_box_str = safe_get(col_indices.get("has_box", 8))
+                        location = safe_get(col_indices.get("location", 10))
                         conn.execute("""INSERT INTO trains (item_name,brand,scale,era,item_type,
                             catalog_number,quantity,condition,has_box,estimated_value,location,notes,is_notable)
                             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            (parts[0].strip(),parts[1].strip(),parts[2].strip(),parts[3].strip(),
-                             parts[4].strip(),parts[5].strip(),qty,parts[7].strip(),
-                             1 if parts[8].strip().lower() in ("yes","1","true","y") else 0,
-                             row_val,parts[10].strip(),row_notes,
-                             1 if is_notable(parts[0].strip(),parts[1].strip(),parts[3].strip()) else 0))
+                            (item_name, brand, scale, era, item_type, catalog_number, qty, condition,
+                             1 if has_box_str.lower() in ("yes","1","true","y") else 0,
+                             row_val, location, row_notes,
+                             1 if is_notable(item_name, brand, era) else 0))
                         count += 1
                     conn.commit(); conn.close()
                     msg = f"Imported {count} items"
@@ -1072,36 +1412,88 @@ def main():
                         "brand", "scale", "era", "type", "item_type",
                         "catalog", "catalog_number", "catalog#", "cat#",
                     }
+                    # Map each CSV column name (case-insensitive) to the index
+                    # we need for insertion. Supports both re-importable format
+                    # (12 columns) and full backup format (all columns + headers).
+                    COL_MAP = {
+                        "item_name": "item_name", "name": "item_name",
+                        "brand": "brand",
+                        "scale": "scale",
+                        "era": "era",
+                        "item_type": "item_type", "type": "item_type",
+                        "catalog_number": "catalog_number", "catalog#": "catalog_number", "cat#": "catalog_number",
+                        "quantity": "quantity", "qty": "quantity",
+                        "condition": "condition",
+                        "has_box": "has_box", "box": "has_box",
+                        "estimated_value": "estimated_value", "value": "estimated_value",
+                        "location": "location",
+                        "notes": "notes",
+                    }
+                    headers = None; col_indices = None
                     for row_idx, parts in enumerate(reader):
                         if not parts or all(not (p or "").strip() for p in parts):
                             continue
-                        if row_idx == 0 and (parts[0] or "").strip().lower() in HEADER_HINTS:
-                            skipped_header = True
-                            continue
-                        while len(parts) < 12:
+                        # On first row, check if it's a header
+                        if row_idx == 0:
+                            first_cell = (parts[0] or "").strip().lower()
+                            is_header = first_cell in HEADER_HINTS
+                            # Also check if it looks like a full-backup header (has "id", "photo_path", etc)
+                            if not is_header and any(h.lower() in first_cell for h in ["item_name", "brand", "catalog", "condition"]):
+                                is_header = True
+                            if is_header:
+                                # Build the column index map
+                                headers = [p.strip().lower() for p in parts]
+                                col_indices = {}
+                                for target_col in COL_MAP.keys():
+                                    for i, h in enumerate(headers):
+                                        if h == target_col or (target_col in COL_MAP and COL_MAP[target_col] and h in COL_MAP[target_col]):
+                                            col_indices[COL_MAP[target_col]] = i
+                                            break
+                                skipped_header = True
+                                continue
+                        # If no header was detected, use positional mapping (original behavior)
+                        if col_indices is None:
+                            col_indices = {
+                                "item_name": 0, "brand": 1, "scale": 2, "era": 3,
+                                "item_type": 4, "catalog_number": 5, "quantity": 6,
+                                "condition": 7, "has_box": 8, "estimated_value": 9,
+                                "location": 10, "notes": 11
+                            }
+                        # Pad if needed
+                        while len(parts) <= max(col_indices.values()):
                             parts.append("")
+                        def safe_get(idx, default=""):
+                            return parts[idx].strip() if idx < len(parts) else default
                         try:
-                            qty = int(parts[6].strip() or "1")
+                            qty = int(safe_get(col_indices.get("quantity", 6)) or "1")
                         except ValueError:
                             qty = 1
-                        row_val = parts[9].strip()
-                        row_notes = parts[11].strip()
+                        row_val = safe_get(col_indices.get("estimated_value", 9))
+                        row_notes = safe_get(col_indices.get("notes", 11))
                         if not row_val:
                             sv, sn = _apply_price_seed({
-                                "brand": parts[1].strip(),
-                                "catalog_number": parts[5].strip(),
+                                "brand": safe_get(col_indices.get("brand", 1)),
+                                "catalog_number": safe_get(col_indices.get("catalog_number", 5)),
                                 "value_notes": row_notes,
                             })
                             if sv:
                                 row_val = sv; row_notes = sn; seeded += 1
+                        item_name = safe_get(col_indices.get("item_name", 0))
+                        brand = safe_get(col_indices.get("brand", 1))
+                        scale = safe_get(col_indices.get("scale", 2))
+                        era = safe_get(col_indices.get("era", 3))
+                        item_type = safe_get(col_indices.get("item_type", 4))
+                        catalog_number = safe_get(col_indices.get("catalog_number", 5))
+                        condition = safe_get(col_indices.get("condition", 7))
+                        has_box_str = safe_get(col_indices.get("has_box", 8))
+                        location = safe_get(col_indices.get("location", 10))
                         conn.execute("""INSERT INTO trains (item_name,brand,scale,era,item_type,
                             catalog_number,quantity,condition,has_box,estimated_value,location,notes,is_notable)
                             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            (parts[0].strip(),parts[1].strip(),parts[2].strip(),parts[3].strip(),
-                             parts[4].strip(),parts[5].strip(),qty,parts[7].strip(),
-                             1 if parts[8].strip().lower() in ("yes","1","true","y") else 0,
-                             row_val,parts[10].strip(),row_notes,
-                             1 if is_notable(parts[0].strip(),parts[1].strip(),parts[3].strip()) else 0))
+                            (item_name, brand, scale, era, item_type, catalog_number, qty,
+                             condition, 1 if has_box_str.lower() in ("yes","1","true","y") else 0,
+                             row_val, location, row_notes,
+                             1 if is_notable(item_name, brand, era) else 0))
                         count += 1
                     conn.commit(); conn.close()
                     msg = f"Imported {count} items from {uploaded.name}"
@@ -1119,6 +1511,19 @@ def main():
         with exp_col:
             st.markdown("### Export")
             if total > 0:
+                # Loud reminder — the silent failure mode is downloading the CSV,
+                # editing in Excel, saving, and never re-uploading. The previous
+                # signal was only a `help=` tooltip on the download button,
+                # which Colin (2026-05-18) never saw. Banner above the buttons
+                # makes the round-trip rule unmissable. The Quick Add form on
+                # the Collection tab is the lower-friction alternative.
+                st.warning(
+                    "⚠️ **Editing in Excel?** Your edits stay on YOUR computer "
+                    "until you upload them back. After you save in Excel, drag "
+                    "the saved file onto the **Upload CSV** box on the left to "
+                    "add your new rows. Or — quicker — use the **➕ Quick add** "
+                    "form at the top of the Collection tab."
+                )
                 conn = get_db()
                 all_df = pd.read_sql_query("SELECT * FROM trains ORDER BY brand, item_name", conn); conn.close()
                 # Codex 2026-05-16 MED: full-backup CSV included `id` first +

@@ -6,3 +6,4 @@ __pycache__/
 test-results/
 .venv/
 venv/
+db/photos/
