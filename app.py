@@ -187,7 +187,7 @@ def _load_family_hints() -> dict:
     train app still runs standalone outside the axiom directory tree.
 
     Codex 2026-05-16 MEDIUM PRIVACY: previous versions hardcoded
-    Dad/Phil/Colin in user-facing copy. The hints are now optional —
+    family first names in user-facing copy. The hints are now optional —
     deployer can leave them empty for a fully generic install.
     """
     global _FAMILY_HINTS_CACHE
@@ -785,7 +785,7 @@ def main():
     # ── Collection ──
     with tab1:
         # Quick Add form — typed entry, no photo / no TSV / no Excel round-trip.
-        # Colin (2026-05-18) lost 4 entries by editing the export CSV in Excel
+        # A family tester (2026-05-18) lost 4 entries by editing the export CSV in Excel
         # and never re-uploading — the previous add paths (Scan Items, paste-
         # import, Import/Export upload) all had friction that didn't match a
         # casual "I just want to type the train name and hit add" mental model.
@@ -841,7 +841,7 @@ def main():
                             st.rerun()
                         except Exception as qa_e:
                             print(f"[quick_add] insert failed: {qa_e}")
-                            st.error("Could not add — please try again. If this keeps happening, tell Phil.")
+                            st.error("Could not add — please try again. If this keeps happening, tell the owner.")
 
         conn = get_db()
         q = "SELECT * FROM trains WHERE 1=1"
@@ -1297,8 +1297,8 @@ def main():
             remaining = sum(1 for a in added if not a)
 
             # Codex 2026-05-16 HIGH: make it unmistakable that scan results are
-            # NOT yet saved. Colin reported the previous green banner ("Found N
-            # items!") felt like confirmation, and he closed the browser before
+            # NOT yet saved. A family tester reported the previous green banner ("Found N
+            # items!") felt like confirmation, and they closed the browser before
             # clicking Add — losing the work. The warning + explicit hint +
             # primary button anchored at the TOP of the results block close
             # that loop.
@@ -1553,7 +1553,7 @@ def main():
                         def safe_get(idx, default=""):
                             return parts[idx].strip() if idx < len(parts) else default
                         try: qty = int(safe_get(col_indices.get("quantity", 6)) or "1")
-                        except: qty = 1
+                        except (ValueError, TypeError): qty = 1
                         row_val = safe_get(col_indices.get("estimated_value", 9))
                         row_notes = safe_get(col_indices.get("notes", 11))
                         if not row_val:
@@ -1589,7 +1589,7 @@ def main():
 
             # Codex 2026-05-16 LOW: wire the upload — previously the uploader
             # read the file but only said "use CSV import in future update,"
-            # which Colin would reasonably read as "import is broken." Now we
+            # which a family tester would reasonably read as "import is broken." Now we
             # detect tab vs comma delimiter from the file content and run the
             # same row-loop as paste-import, including the price-seed lookup.
             uploaded = st.file_uploader("Or upload CSV/TSV", type=["csv","tsv","txt"])
@@ -1712,7 +1712,7 @@ def main():
                 # Loud reminder — the silent failure mode is downloading the CSV,
                 # editing in Excel, saving, and never re-uploading. The previous
                 # signal was only a `help=` tooltip on the download button,
-                # which Colin (2026-05-18) never saw. Banner above the buttons
+                # which the family tester (2026-05-18) never saw. Banner above the buttons
                 # makes the round-trip rule unmissable. The Quick Add form on
                 # the Collection tab is the lower-friction alternative.
                 st.warning(

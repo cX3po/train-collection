@@ -1,7 +1,7 @@
 /**
  * tests/test_bundle13.spec.mjs
  *
- * Bundle 13 verification — Codex pre-Colin fixes:
+ * Bundle 13 verification — Codex pre-family-test fixes:
  *  1. App loads cleanly after the helpers changed (no traceback)
  *  2. Scan tab still renders the upload widget (regression check)
  *  3. Focus banner appears for a non-existent ID without throwing
@@ -21,7 +21,7 @@ import { test, expect } from '@playwright/test';
 const BASE_URL = process.env.TRAINS_BASE_URL || 'http://127.0.0.1:8502';
 const APP_LOAD_TIMEOUT = 20_000;
 
-test.describe('Bundle 13 — Codex pre-Colin fixes', () => {
+test.describe('Bundle 13 — Codex pre-family-test fixes', () => {
   test('app still loads after helper refactors', async ({ page }) => {
     await page.goto(`${BASE_URL}/?user=SmokeTest`);
     await expect(page.getByText('Signed in as:')).toBeVisible({ timeout: APP_LOAD_TIMEOUT });

@@ -7,3 +7,4 @@ test-results/
 .venv/
 venv/
 db/photos/
+review/
