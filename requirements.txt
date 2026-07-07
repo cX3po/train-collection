@@ -3,3 +3,6 @@ pandas
 requests
 openpyxl
 segno
+Pillow
+pillow-heif
+pillow-avif-plugin

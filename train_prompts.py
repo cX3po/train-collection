@@ -11,12 +11,11 @@ For each item, provide:
 - catalog_number: if visible or identifiable
 - condition: Mint (C10), Excellent (C8-9), Good (C6-7), Fair (C4-5), Poor (C1-3)
 - has_original_box: true/false/unknown
-- estimated_value: current market value in USD (integer, or null if uncertain)
-- value_notes: what affects the value (box, rarity, color variation, etc.)
+- estimated_value: your best rough current market midpoint in USD as an integer. Always provide a rough estimate when a model train is visible, even if confidence is low. Use null only if the image does not show a model train at all.
+- value_notes: REQUIRED. Explain what affects the value and what is still needed to value it better: clearer brand/logo, catalog number, underside photo, box photo, condition closeups, missing parts, scale/gauge, or whether it runs.
 - confidence: high, medium, or low
 
-IMPORTANT: If you cannot confidently identify the value, set estimated_value to null.
-Never invent prices. Say "needs research" if unsure.
+IMPORTANT: Do not pretend certainty. If unsure, give a conservative rough estimate and say what detail would improve the value in value_notes.
 
 Return ONLY a JSON array, no markdown:
 [{"item_name": "...", "brand": "...", ...}]
@@ -31,7 +30,8 @@ For each item provide:
 - scale: gauge/scale
 - type: Locomotive, Car, Accessory, Track, Box, etc.
 - condition: Mint/Excellent/Good/Fair/Poor
-- estimated_value: USD integer or null
+- estimated_value: best rough current market midpoint in USD as an integer. Always provide a rough estimate when a model train is visible; use null only if no model train is visible.
+- value_notes: REQUIRED. Explain what would improve the value estimate: brand/logo, catalog number, underside photo, box, condition closeups, missing parts, scale/gauge, or whether it runs.
 - confidence: high/medium/low
 
 Focus on identifying as many individual items as possible. Include boxes, accessories, transformers, track sections - everything with value.

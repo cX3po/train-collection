@@ -95,6 +95,21 @@ def _find_claude_cli() -> str:
     return cli if cli and os.path.exists(cli) else ""
 
 
+def _claude_subscription_env() -> dict[str, str]:
+    """Environment for Claude CLI subscription calls.
+
+    The train app may load an Anthropic API key for legacy raw-API fallbacks,
+    but `claude -p` treats that key as higher priority than the user's Claude.ai
+    login. When an API key is present, file/image connectors are disabled and
+    photo scans fail before the model sees the picture. Scrub Anthropic env auth
+    so the CLI uses the signed-in Claude.ai account.
+    """
+    return {
+        k: v for k, v in os.environ.items()
+        if not k.startswith("ANTHROPIC_")
+    }
+
+
 def _call_subscription(image_bytes: bytes, prompt: str, api_key: str, timeout: int) -> str:
     """Vision via the operator's Max subscription (the `claude` CLI) — NO API key.
 
@@ -123,6 +138,7 @@ def _call_subscription(image_bytes: bytes, prompt: str, api_key: str, timeout: i
                 [cli, "-p", full_prompt],
                 capture_output=True, text=True, timeout=eff_timeout,
                 stdin=subprocess.DEVNULL,
+                env=_claude_subscription_env(),
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"Subscription vision timed out after {eff_timeout}s.")

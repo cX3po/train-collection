@@ -14,9 +14,13 @@ import segno
 from datetime import datetime
 
 # Family-deployment limits (5-user-max app self-hosted on the family server)
-MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB per uploaded photo
+MAX_FILE_BYTES = 25 * 1024 * 1024  # 25 MB intake; photos are downscaled before AI
 MAX_PHOTOS_PER_SCAN = 10
 SQLITE_BUSY_TIMEOUT_MS = 5000
+SCAN_PHOTO_TYPES = [
+    "jpg", "jpeg", "jpe", "jfif", "png", "webp",
+    "heic", "heif", "avif", "bmp", "tif", "tiff",
+]
 
 
 def _claude_cli_supports(flag: str) -> bool:
@@ -78,7 +82,20 @@ PHOTO_MAX_DIMENSION = 1600  # px — downscale longest side to bound disk usage
 DEFAULT_PUBLIC_BASE_URL = os.getenv("TRAIN_APP_BASE_URL", "https://train.path-os.net")
 
 
-def _safe_photo_path(rel_or_abs: str) -> str | None:
+def _register_pillow_phone_formats() -> None:
+    """Enable optional Pillow plugins for common phone/downloaded image formats."""
+    try:
+        import pillow_heif
+        pillow_heif.register_heif_opener()
+    except Exception:
+        pass
+    try:
+        import pillow_avif  # noqa: F401
+    except Exception:
+        pass
+
+
+def _safe_photo_path(rel_or_abs) -> str | None:
     """Resolve a stored photo_path and confirm it stays inside PHOTOS_DIR.
 
     Codex 2026-05-16 MEDIUM: gallery/focus do os.path.join(app_dir, fphoto)
@@ -87,7 +104,7 @@ def _safe_photo_path(rel_or_abs: str) -> str | None:
     db/photos. This validator returns the canonical absolute path if and
     only if it lives inside PHOTOS_DIR; otherwise None.
     """
-    if not rel_or_abs:
+    if not rel_or_abs or not isinstance(rel_or_abs, (str, bytes, os.PathLike)):
         return None
     app_dir = os.path.dirname(os.path.abspath(__file__))
     candidate = os.path.normpath(os.path.join(app_dir, rel_or_abs))
@@ -349,9 +366,17 @@ def _qr_svg_for(train_id: int, base_url: str, user: str) -> str:
     safe_user = urllib.parse.quote(user, safe="")
     url = f"{base_url.rstrip('/')}/?user={safe_user}&focus={train_id}"
     qr = segno.make(url, error="m")
-    buf = io.StringIO()
-    qr.save(buf, kind="svg", scale=4, border=0, xmldecl=False, svgns=False, omithw=True)
-    return buf.getvalue()
+    def _save_svg(**kwargs) -> str:
+        buf = io.BytesIO()
+        qr.save(buf, kind="svg", scale=4, border=0, **kwargs)
+        return buf.getvalue().decode("utf-8", errors="replace")
+
+    try:
+        return _save_svg(xmldecl=False, svgns=False, omithw=True)
+    except TypeError:
+        # Older segno builds do not support omithw. Fall back to a valid SVG
+        # instead of printing labels with blank QR boxes.
+        return _save_svg(xmldecl=False, svgns=False)
 
 
 def _save_train_photo(img_bytes: bytes, train_id: int) -> str | None:
@@ -363,6 +388,7 @@ def _save_train_photo(img_bytes: bytes, train_id: int) -> str | None:
     never block adding the item.
     """
     try:
+        _register_pillow_phone_formats()
         from PIL import Image
         import io as _io
         img = Image.open(_io.BytesIO(img_bytes))
@@ -390,6 +416,122 @@ def _save_train_photo(img_bytes: bytes, train_id: int) -> str | None:
         print(f"[photo_save] failed for train_id={train_id}: {e}")
         return None
 
+
+def _read_uploaded_photo(uploaded) -> bytes:
+    """Read a Streamlit UploadedFile without depending on its current cursor."""
+    if uploaded is None:
+        return b""
+    try:
+        return uploaded.getvalue()
+    except Exception:
+        try:
+            uploaded.seek(0)
+        except Exception:
+            pass
+        return uploaded.read()
+
+
+def _normalize_scan_photo(uploaded) -> bytes:
+    """Return phone-friendly JPEG bytes for vision scanning.
+
+    Dad's real workflow is phone-first: camera photos can be large, rotated by
+    EXIF, or HEIC on iPhones. Normalize what Pillow can read into a bounded JPEG
+    before it reaches engine.validate_image(), so scan reliability is not tied
+    to the original phone format or file size.
+    """
+    raw = _read_uploaded_photo(uploaded)
+    name = getattr(uploaded, "name", "photo") or "photo"
+    if not raw:
+        raise ValueError(f"{name}: no image data.")
+    if len(raw) > MAX_FILE_BYTES:
+        raise ValueError(
+            f"{name}: photo is {len(raw) / 1024 / 1024:.1f} MB. "
+            f"Limit is {MAX_FILE_BYTES // 1024 // 1024} MB."
+        )
+    try:
+        _register_pillow_phone_formats()
+        from PIL import Image, ImageOps, UnidentifiedImageError
+        import io as _io
+
+        try:
+            img = Image.open(_io.BytesIO(raw))
+        except UnidentifiedImageError:
+            raise ValueError(
+                f"{name}: this photo format is not readable here. If this came "
+                "from an iPhone, set Camera > Formats > Most Compatible or "
+                "choose a JPG/PNG export."
+            )
+        img = ImageOps.exif_transpose(img)
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        img.thumbnail((PHOTO_MAX_DIMENSION, PHOTO_MAX_DIMENSION), Image.LANCZOS)
+
+        quality = 88
+        while True:
+            out = _io.BytesIO()
+            img.save(out, format="JPEG", quality=quality, optimize=True)
+            data = out.getvalue()
+            if len(data) <= 15 * 1024 * 1024 or quality <= 70:
+                return data
+            quality -= 8
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"{name}: could not prepare photo for scanning ({e}).")
+
+
+def _scan_train_photo(engine, image_bytes: bytes, prompt: str):
+    """Run train vision with a second pass tuned for downloaded/screenshot images."""
+    results = engine.analyze(image_bytes, prompt)
+    if results:
+        return results
+
+    downloaded_prompt = prompt + """
+
+This may be a downloaded picture, screenshot, auction image, catalog image,
+or web listing rather than a fresh camera photo. Read any visible text,
+captions, boxes, logos, catalog numbers, and listing labels. Ignore phone UI,
+browser chrome, white borders, watermarks, and background page text that is
+not about the train. If you can identify the train only partially, return one
+best-effort item with confidence "low" and estimated_value null. Do not invent
+prices.
+
+Return ONLY a JSON array. If there is truly no model train visible, return: []"""
+    return engine.analyze(image_bytes, downloaded_prompt)
+
+
+def _insert_train_from_scan(item: dict, image_bytes: bytes | None = None) -> int:
+    """Insert one scan/manual item and optionally persist the source photo."""
+    seeded_val, seeded_notes = _apply_price_seed(item)
+    conn = get_db()
+    cur = conn.execute(
+        """INSERT INTO trains (item_name,brand,scale,era,item_type,
+            catalog_number,condition,has_box,estimated_value,value_notes,
+            is_notable,last_updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            item.get("item_name", ""),
+            item.get("brand", ""),
+            item.get("scale", ""),
+            item.get("era", ""),
+            item.get("item_type") or item.get("type", ""),
+            item.get("catalog_number", ""),
+            item.get("condition", ""),
+            1 if item.get("has_original_box") else 0,
+            seeded_val,
+            seeded_notes,
+            1 if is_notable(item.get("item_name", ""), item.get("brand", ""), item.get("era", "")) else 0,
+            datetime.now().isoformat(),
+        ),
+    )
+    train_id = cur.lastrowid
+    if image_bytes:
+        rel = _save_train_photo(image_bytes, train_id)
+        if rel:
+            conn.execute("UPDATE trains SET photo_path=? WHERE id=?", (rel, train_id))
+    conn.commit()
+    conn.close()
+    return train_id
+
 def get_db():
     init_db()
     conn = sqlite3.connect(DB_PATH, timeout=5.0)
@@ -414,9 +556,9 @@ if os.path.exists(CLAUDE_BIN) and not CLAUDE_CLI_USABLE:
 def _chat_via_cli(message, system, history):
     """Run AX via local Claude CLI (Max subscription, $0 marginal cost).
 
-    Scrubs ANTHROPIC_API_KEY from the child env — claude CLI prefers the API
-    key over the Max OAuth subscription when both are present, and inheriting
-    the parent's key would silently bill per-token (COST.md scar 2026-04-22).
+    Scrubs Anthropic env auth from the child env — claude CLI prefers API/env
+    auth over the Max OAuth subscription when both are present, and inheriting
+    the parent's key would silently bill per-token or disable file connectors.
     """
     if not CLAUDE_CLI_USABLE:
         return None  # caller falls back
@@ -429,7 +571,7 @@ def _chat_via_cli(message, system, history):
     transcript_parts.append(f"USER: {message}")
     full_input = "\n\n".join(transcript_parts)
 
-    child_env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    child_env = {k: v for k, v in os.environ.items() if not k.startswith("ANTHROPIC_")}
     cmd = [CLAUDE_BIN, "-p", "--model", "claude-haiku-4-5-20251001",
            "--append-system-prompt", system]
     try:
@@ -585,7 +727,7 @@ def main():
                     with fcols[0]:
                         photo_abs = _safe_photo_path(fphoto)
                         if photo_abs:
-                            st.image(photo_abs, use_container_width=True)
+                            st.image(photo_abs, width="stretch")
                         else:
                             st.caption(":camera_with_flash: _no photo on file_")
                     with fcols[1]:
@@ -736,7 +878,7 @@ def main():
                             try:
                                 photo_abs = _safe_photo_path(row.get("photo_path") or "")
                                 if photo_abs:
-                                    st.image(photo_abs, use_container_width=True)
+                                    st.image(photo_abs, width="stretch")
                                 else:
                                     st.caption(":camera_with_flash: _no photo_")
                                 name = (row.get("item_name") or "Unknown").strip()
@@ -754,7 +896,7 @@ def main():
 
                                 # Delete photo button (only show if photo exists)
                                 if photo_abs:
-                                    if st.button("🗑️ Delete Photo", key=f"gallery_delete_{tid}", use_container_width=True, type="secondary"):
+                                    if st.button("🗑️ Delete Photo", key=f"gallery_delete_{tid}", width="stretch", type="secondary"):
                                         st.session_state[f"confirm_gallery_delete_{tid}"] = True
 
                                 # Confirmation dialog
@@ -806,7 +948,7 @@ def main():
                 # had NaN id and were silently dropped (data loss). Pin to
                 # "fixed" since the intended add path is the Scan Items tab.
                 edited = st.data_editor(df[avail], column_config=col_config,
-                                       use_container_width=True, height=600, num_rows="fixed")
+                                       width="stretch", height=600, num_rows="fixed")
                 if st.button("Save Changes", type="primary"):
                     conn = get_db()
                     for _, row in edited.iterrows():
@@ -911,14 +1053,14 @@ def main():
                     with upc2:
                         photo_file = st.file_uploader(
                             "Photo",
-                            type=["jpg","jpeg","png","webp"],
+                            type=SCAN_PHOTO_TYPES,
                             label_visibility="collapsed",
                             key="upload_photo_for_item"
                         )
 
                     if photo_file and st.button("Save Photo", type="primary", key="save_item_photo"):
                         try:
-                            img_bytes = photo_file.read()
+                            img_bytes = _normalize_scan_photo(photo_file)
                             rel_path = _save_train_photo(img_bytes, selected_id)
                             if rel_path:
                                 conn = get_db()
@@ -1024,28 +1166,47 @@ def main():
             "Shelf/Table Scan (1 photo, finds ALL items)",
             "Batch Scan (multiple photos, 1 item each)"
         ], horizontal=False)
-        photos = st.file_uploader(
-            f"Upload photo(s) - up to {MAX_PHOTOS_PER_SCAN}, max {MAX_FILE_BYTES // 1024 // 1024} MB each",
-            type=["jpg","jpeg","png","webp"], accept_multiple_files=True)
+        ccam, cup = st.columns([1, 1])
+        with ccam:
+            camera_photo = st.camera_input(
+                "Take a photo now",
+                help="Best for phone use: point at one train or shelf, take the photo, then scan.",
+                key="scan_camera_photo",
+            )
+        with cup:
+            uploaded_photos = st.file_uploader(
+                f"Or choose saved photo(s) - up to {MAX_PHOTOS_PER_SCAN}",
+                type=SCAN_PHOTO_TYPES,
+                accept_multiple_files=True,
+                help="JPG, PNG, WebP, and HEIC/HEIF when server support is installed.",
+            )
 
-        if photos:
-            if len(photos) > MAX_PHOTOS_PER_SCAN:
-                st.error(f"Too many photos. Limit is {MAX_PHOTOS_PER_SCAN} per scan; you uploaded {len(photos)}. Take a smaller batch.")
-                photos = []
+        scan_sources = []
+        if camera_photo:
+            scan_sources.append(("Camera photo", camera_photo))
+        for p in uploaded_photos or []:
+            scan_sources.append((getattr(p, "name", "Uploaded photo"), p))
+
+        if scan_sources:
+            if len(scan_sources) > MAX_PHOTOS_PER_SCAN:
+                st.error(
+                    f"Too many photos. Limit is {MAX_PHOTOS_PER_SCAN} per scan; "
+                    f"you selected {len(scan_sources)}. Take a smaller batch."
+                )
+                scan_sources = []
             else:
-                oversized = [p.name for p in photos if p.size > MAX_FILE_BYTES]
-                if oversized:
-                    st.warning(f"Skipping over-{MAX_FILE_BYTES // 1024 // 1024}-MB photo(s): {', '.join(oversized)}")
-                    photos = [p for p in photos if p.size <= MAX_FILE_BYTES]
-                if photos:
-                    total_mb = sum(p.size for p in photos) / 1024 / 1024
-                    st.caption(f"{len(photos)} photo(s) selected · {total_mb:.1f} MB total")
+                total_mb = sum(getattr(p, "size", 0) or len(_read_uploaded_photo(p))
+                               for _, p in scan_sources) / 1024 / 1024
+                st.caption(
+                    f"{len(scan_sources)} photo(s) ready · {total_mb:.1f} MB before compression. "
+                    "The app will rotate/downsize them before scanning."
+                )
 
         # Bundle 9 fix: scan TRIGGER stores results in session_state; RENDER
         # reads from session_state below. This survives Streamlit reruns so
         # "Add This One" / "Add ALL" no longer make the results vanish — that
         # was the "can only save 3 pictures" symptom Dad reported.
-        if photos and st.button("Scan All Photos", type="primary"):
+        if scan_sources and st.button("Scan Photo(s)", type="primary"):
             # Vision runs on the Max subscription (the claude CLI), not a raw API
             # key — so the gate is CLI availability, not API_KEY. The subscription
             # path can't be broken by key corruption/rotation/deactivation.
@@ -1059,25 +1220,49 @@ def main():
 
                     new_items = []
                     new_images = []
-                    for i, photo in enumerate(photos):
-                        img_bytes = photo.read()
+                    image_labels = []
+                    failures = []
+                    for i, (label, photo) in enumerate(scan_sources):
+                        try:
+                            img_bytes = _normalize_scan_photo(photo)
+                        except ValueError as ve:
+                            failures.append(str(ve))
+                            continue
+                        photo_index = len(new_images)
                         new_images.append(img_bytes)
+                        image_labels.append(label)
                         prompt = TRAIN_ROOM_SCAN if scan_type.startswith("Shelf") else TRAIN_IDENTIFIER
-                        with st.spinner(f"Scanning photo {i+1} of {len(photos)}..."):
-                            results = engine.analyze(img_bytes, prompt)
-                            for r in results:
-                                r.raw["_photo_index"] = i
-                                new_items.append(r.raw)
+                        try:
+                            with st.spinner(f"Scanning {label} ({i+1} of {len(scan_sources)})..."):
+                                results = _scan_train_photo(engine, img_bytes, prompt)
+                                for r in results:
+                                    r.raw["_photo_index"] = photo_index
+                                    new_items.append(r.raw)
+                        except Exception as pe:
+                            failures.append(f"{label}: scan failed ({pe})")
+
+                    st.session_state["scan_last_photos"] = {
+                        "images": new_images,
+                        "labels": image_labels,
+                        "failures": failures,
+                    }
 
                     if new_items:
                         st.session_state["scan_results"] = {
                             "images": new_images,
+                            "labels": image_labels,
                             "items": new_items,
                             "added": [False] * len(new_items),
                         }
                         st.rerun()  # render block below picks up the fresh state
                     else:
-                        st.warning("Could not identify items. Try clearer photos with good lighting.")
+                        st.warning(
+                            "No items were identified automatically. The photo is still available below "
+                            "so you can save the train manually."
+                        )
+                    if failures:
+                        for failure in failures:
+                            st.error(failure)
                 except ValueError as ve:
                     # validate_image: too small, too large, unrecognized format
                     print(f"[scan] validation error: {ve}")
@@ -1098,6 +1283,7 @@ def main():
         if scan_state and scan_state.get("items"):
             items = scan_state["items"]
             images = scan_state.get("images", [])
+            labels = scan_state.get("labels", [])
             # Codex 2026-05-16: normalize `added` shape on read so a stale
             # session_state shape (e.g. after a hot reload mid-add) cannot
             # raise IndexError in the loops below.
@@ -1135,41 +1321,22 @@ def main():
                     type="primary",
                     key="add_all_trains",
                 ):
-                    conn = get_db()
                     added_count = 0
                     for idx, d in enumerate(items):
                         if added[idx]:
                             continue
-                        # Bundle 12: price-seed lookup — fills estimated_value from
-                        # the seed table when vision returned no value and the
-                        # (brand, catalog_number) is in the guide.
-                        seeded_val, seeded_notes = _apply_price_seed(d)
-                        cur = conn.execute(
-                            """INSERT INTO trains (item_name,brand,scale,era,item_type,
-                                catalog_number,condition,has_box,estimated_value,value_notes,
-                                is_notable,last_updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            (d.get("item_name", ""), d.get("brand", ""), d.get("scale", ""),
-                             d.get("era", ""), d.get("item_type") or d.get("type", ""), d.get("catalog_number", ""),
-                             d.get("condition", ""), 1 if d.get("has_original_box") else 0,
-                             seeded_val, seeded_notes,
-                             1 if is_notable(d.get("item_name", ""), d.get("brand", ""), d.get("era", "")) else 0,
-                             datetime.now().isoformat()))
-                        # Bundle 10: persist the source photo alongside the row.
-                        # Failure of the photo save must NEVER block the add.
                         pi = d.get("_photo_index")
-                        if isinstance(pi, int) and 0 <= pi < len(images):
-                            rel = _save_train_photo(images[pi], cur.lastrowid)
-                            if rel:
-                                conn.execute("UPDATE trains SET photo_path=? WHERE id=?", (rel, cur.lastrowid))
+                        img = images[pi] if isinstance(pi, int) and 0 <= pi < len(images) else None
+                        _insert_train_from_scan(d, img)
                         added[idx] = True
                         added_count += 1
-                    conn.commit(); conn.close()
                     st.session_state["scan_results"]["added"] = added
                     st.success(f"Added {added_count} items to collection!")
                     st.rerun()
             with btn_col2:
                 if st.button("Clear scan / start over", key="clear_scan"):
                     st.session_state.pop("scan_results", None)
+                    st.session_state.pop("scan_last_photos", None)
                     st.rerun()
 
             # Display results grouped by photo
@@ -1177,7 +1344,8 @@ def main():
                 photo_idxs = [idx for idx, d in enumerate(items) if d.get("_photo_index") == i]
                 if not photo_idxs:
                     continue
-                st.markdown(f"### Photo {i+1} — {len(photo_idxs)} item(s)")
+                label = labels[i] if i < len(labels) else f"Photo {i+1}"
+                st.markdown(f"### {label} — {len(photo_idxs)} item(s)")
                 col1, col2 = st.columns([1, 2])
                 with col1:
                     st.image(img_bytes, width=280)
@@ -1197,28 +1365,58 @@ def main():
                             st.markdown(":white_check_mark: **Added to collection**")
                         else:
                             if st.button("Add This One", key=f"add_item_{idx}"):
-                                conn = get_db()
-                                seeded_val, seeded_notes = _apply_price_seed(d)
-                                cur = conn.execute(
-                                    """INSERT INTO trains (item_name,brand,scale,era,item_type,
-                                        catalog_number,condition,has_box,estimated_value,value_notes,
-                                        is_notable,last_updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                                    (d.get("item_name", ""), d.get("brand", ""), d.get("scale", ""),
-                                     d.get("era", ""), d.get("item_type") or d.get("type", ""), d.get("catalog_number", ""),
-                                     d.get("condition", ""), 1 if d.get("has_original_box") else 0,
-                                     seeded_val, seeded_notes,
-                                     1 if is_notable(d.get("item_name", ""), d.get("brand", ""), d.get("era", "")) else 0,
-                                     datetime.now().isoformat()))
-                                # Bundle 10: photo save alongside row.
-                                if 0 <= i < len(images):
-                                    rel = _save_train_photo(images[i], cur.lastrowid)
-                                    if rel:
-                                        conn.execute("UPDATE trains SET photo_path=? WHERE id=?", (rel, cur.lastrowid))
-                                conn.commit(); conn.close()
+                                _insert_train_from_scan(d, images[i] if 0 <= i < len(images) else None)
                                 added[idx] = True
                                 st.session_state["scan_results"]["added"] = added
                                 st.rerun()
                         st.markdown("---")
+
+        last_photos = st.session_state.get("scan_last_photos") or {}
+        manual_images = last_photos.get("images") or []
+        manual_labels = last_photos.get("labels") or []
+        for failure in last_photos.get("failures") or []:
+            st.error(failure)
+        if manual_images:
+            with st.expander("Add manually from the last photo", expanded=not bool(scan_state and scan_state.get("items"))):
+                st.caption("Use this when the scan misses, the service is down, or you already know what the train is.")
+                manual_idx = 0
+                if len(manual_images) > 1:
+                    manual_idx = st.selectbox(
+                        "Which photo?",
+                        range(len(manual_images)),
+                        format_func=lambda i: manual_labels[i] if i < len(manual_labels) else f"Photo {i+1}",
+                        key="manual_scan_photo_select",
+                    )
+                st.image(manual_images[manual_idx], width=280)
+                with st.form("manual_scan_add", clear_on_submit=True):
+                    m1, m2, m3 = st.columns([2, 2, 1])
+                    with m1:
+                        m_name = st.text_input("Train name *", placeholder="e.g. Lionel 2056 Hudson")
+                        m_brand = st.text_input("Brand", placeholder="Lionel, MTH, American Flyer")
+                    with m2:
+                        m_scale = st.selectbox("Scale", ["", "#1", "G-Scale", "O", "S", "HO", "N", "Standard Gauge", "Other"])
+                        m_type = st.text_input("Type", placeholder="Locomotive, Freight Car, Caboose")
+                    with m3:
+                        m_catalog = st.text_input("Catalog #", placeholder="optional")
+                        m_condition = st.selectbox("Condition", ["Good", "Mint", "Like New", "Excellent", "Fair", "Poor"])
+                    m_box = st.checkbox("Has original box")
+                    submitted_manual = st.form_submit_button("Save manual item with this photo", type="primary")
+                    if submitted_manual:
+                        if not m_name.strip():
+                            st.error("Train name is required.")
+                        else:
+                            item = {
+                                "item_name": m_name.strip(),
+                                "brand": m_brand.strip(),
+                                "scale": m_scale.strip(),
+                                "item_type": m_type.strip(),
+                                "catalog_number": m_catalog.strip(),
+                                "condition": m_condition.strip(),
+                                "has_original_box": m_box,
+                            }
+                            _insert_train_from_scan(item, manual_images[manual_idx])
+                            st.success(f"Saved {m_name.strip()} with photo.")
+                            st.rerun()
 
     # ── Ask AX ──
     with tab3:
